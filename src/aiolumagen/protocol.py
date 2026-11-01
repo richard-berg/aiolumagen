@@ -103,6 +103,14 @@ The C++ implementation used 512 for the tight ESP32 memory budget; 4096 is
 fine in Python and gives us plenty of headroom for pathological bursts.
 """
 
+MAX_LINE_LENGTH = 512
+"""Longest complete line worth parsing.
+
+Real responses are well under 200 characters. Anything longer is damage —
+lines merged by a lost terminator, or noise — and parsing it field by field
+would write garbage into whatever fields happen to line up.
+"""
+
 
 # I24 field indices. Documented in the old C++ header and in
 # Tip0011_RS232CommandInterface. The comment keys map to Lumagen's
@@ -322,6 +330,9 @@ class LumagenProtocol:
                 raw = raw[:-1]
             if not raw:
                 continue
+            if len(raw) > MAX_LINE_LENGTH:
+                _LOGGER.debug("Discarding a %d-byte line as damaged", len(raw))
+                continue
             try:
                 line = raw.decode("ascii", errors="replace")
             except Exception:  # pragma: no cover — decode("replace") can't raise
@@ -469,17 +480,16 @@ class LumagenProtocol:
         serial into one discarded string. Fields beyond the fourth (if a
         future firmware adds any) are ignored here but remain visible in
         :attr:`~aiolumagen.state.LumagenState.device_info_raw`.
+
+        A field left empty — a reply cut short or damaged in transit — keeps
+        the value already known rather than blanking the unit's identity.
         """
         state.device_info_raw = data
-        parts = data.split(",")
-        if len(parts) >= 1:
-            state.model = parts[0]
-        if len(parts) >= 2:
-            state.firmware = parts[1]
-        if len(parts) >= 3:
-            state.model_number = parts[2]
-        if len(parts) >= 4:
-            state.serial = parts[3]
+        parts = [part.strip() for part in data.split(",")]
+        fields = ("model", "firmware", "model_number", "serial")
+        for name, value in zip(fields, parts, strict=False):
+            if value:
+                setattr(state, name, value)
 
     @staticmethod
     def _handle_i00(data: str, state: LumagenState) -> None:

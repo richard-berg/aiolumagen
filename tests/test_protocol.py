@@ -51,6 +51,41 @@ def test_s01_device_info_splits_model_and_firmware() -> None:
     assert state.device_info_raw == "RadiancePro,030225,1018,000000"
 
 
+@pytest.mark.parametrize(
+    "damaged",
+    [b"!S01,\r\n", b"!S01,RadiancePro,,,\r\n", b"!S01,,030225\r\n", b"!S01, , , , \r\n"],
+)
+def test_s01_with_empty_fields_keeps_the_known_identity(damaged: bytes) -> None:
+    """A reply cut short or damaged must not blank the model or firmware."""
+    _, proto = _collect()
+    proto.feed_bytes(b"!S01,RadiancePro,030225,1018,003830\r\n")
+    proto.feed_bytes(damaged)
+    state = proto.state
+    assert (state.model, state.firmware, state.model_number, state.serial) == (
+        "RadiancePro",
+        "030225",
+        "1018",
+        "003830",
+    )
+
+
+def test_s01_updates_fields_that_are_present() -> None:
+    _, proto = _collect()
+    proto.feed_bytes(b"!S01,RadiancePro,030225,1018,003830\r\n")
+    proto.feed_bytes(b"!S01,RadiancePro,030326,1018,003830\r\n")
+    assert proto.state.firmware == "030326"
+
+
+def test_overlong_line_is_discarded_and_parsing_continues() -> None:
+    """Regression: a 10 KB line of 9s arriving with its newline set every I25 field to 9."""
+    _, proto = _collect()
+    proto.feed_bytes(b"!S02,1\r\n")
+    proto.feed_bytes(b"!I25," + b"9," * 5000 + b"\r\n")
+    assert proto.state.current_input is None
+    proto.feed_bytes(b"!S02,0\r\n")
+    assert proto.state.power_on is False
+
+
 def test_echo_prefix_is_tolerated() -> None:
     """Lumagen can echo the query command before the response on the same line."""
     updates, proto = _collect()
