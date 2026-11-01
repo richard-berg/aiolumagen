@@ -422,6 +422,41 @@ async def test_reconnect_recovers_a_half_open_link(fake_transport: FakeTransport
     await c.stop()
 
 
+async def test_listeners_hear_when_the_link_comes_back(fake_transport: FakeTransport) -> None:
+    """Regression: recovery was silent when the device's state hadn't changed.
+
+    Listeners heard "_unavailable" but nothing on the way back, because the
+    protocol only reports changes. Home Assistant renders availability when a
+    listener fires, so after a silent-device outage every entity stayed
+    unavailable on a healthy link until the Lumagen happened to change state.
+    """
+    c = _FastReconnectClient(
+        fake_transport,
+        power_poll_interval=0.05,
+        status_poll_interval=None,
+        stale_timeout=0.3,
+    )
+    events: list[tuple[str, ...]] = []
+    c.subscribe(lambda _state, codes: events.append(codes))
+    await c.start()
+    events.clear()
+
+    fake_transport.silent = True
+    await _wait_until(lambda: not c.available, timeout=5.0)
+    fake_transport.silent = False
+    await _wait_until(lambda: ("_available",) in events, timeout=5.0)
+    assert c.available
+    assert events.index(("_unavailable",)) < events.index(("_available",))
+    assert events.count(("_available",)) == 1
+
+    # And through a full reconnect, where the handshake re-reads unchanged state.
+    events.clear()
+    fake_transport.drop()
+    await _wait_until(lambda: ("_available",) in events, timeout=5.0)
+    assert events.count(("_unavailable",)) == 1
+    await c.stop()
+
+
 async def test_link_supervision_does_not_reconnect_a_healthy_link(
     fake_transport: FakeTransport,
 ) -> None:

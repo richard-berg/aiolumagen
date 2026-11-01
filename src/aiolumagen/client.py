@@ -1318,9 +1318,7 @@ class LumagenClient:
         if self._available:
             self._available = False
             _LOGGER.warning("Lumagen is now unavailable (%s), reconnecting", reason)
-            for listener in list(self._listeners):
-                with suppress(Exception):
-                    listener(self._protocol.state, ("_unavailable",))
+            self._notify_listeners(("_unavailable",))
             # Anything still awaiting a reply is waiting on a subscription
             # we're about to throw away.
             self._fail_waiters("Transport reconnecting; response will not arrive")
@@ -1373,7 +1371,8 @@ class LumagenClient:
         liveness.
         """
         self._last_response_time = asyncio.get_event_loop().time()
-        if not self._available:
+        recovered = not self._available
+        if recovered:
             self._available = True
             if self._reconnect_failures:
                 _LOGGER.info(
@@ -1389,6 +1388,17 @@ class LumagenClient:
         self._next_reconnect_at = 0.0
         self._reconnect_failures = 0
         self._protocol.feed_bytes(data)
+        if recovered:
+            # The counterpart of "_unavailable". Listeners otherwise only hear
+            # about state changes, and a device whose state didn't change
+            # during the outage would never tell them the link is back.
+            self._notify_listeners(("_available",))
+
+    def _notify_listeners(self, codes: tuple[str, ...]) -> None:
+        """Tell listeners about a link event; one failing listener can't stop the rest."""
+        for listener in list(self._listeners):
+            with suppress(Exception):
+                listener(self._protocol.state, codes)
 
     def _on_protocol_update(self, state: LumagenState, codes: tuple[str, ...]) -> None:
         for listener in list(self._listeners):
