@@ -118,7 +118,7 @@ uv run python examples/via_url.py 'esphome://10.0.0.42:6053/?port_name=Lumagen&k
 ## Versioning & Distribution
 
 - Version lives in `pyproject.toml` and `aiolumagen/__init__.py` (`__version__`). Keep them in sync.
-- Not on PyPI yet — `ha-lumagen`'s manifest installs it from git (`aiolumagen@git+https://github.com/frankrosano/aiolumagen.git@<tag>`). Pin the tag you cut rather than `@main` so an install resolves to a known artifact.
+- Published on PyPI. Pushing a `v<version>` tag runs `.github/workflows/publish.yml`: CI, a check that the tag matches both version strings, then `uv publish` via PyPI trusted publishing (`publish` environment). `ha-lumagen`'s manifest pins `aiolumagen==<version>`.
 - Local development: `ha-lumagen`'s `pyproject.toml` uses `[tool.uv.sources]` to point at this repo via path with `editable = true`.
 
 ## Lumagen Protocol Notes

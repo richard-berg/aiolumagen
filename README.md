@@ -2,9 +2,9 @@
 
 Async Python library for the Lumagen Radiance Pro RS-232 protocol.
 
-The library is protocol-only — no Home Assistant imports, no UI, no opinion about how the state should be surfaced. The [`ha-lumagen`](../ha-lumagen) custom integration consumes it.
+The library is protocol-only — no Home Assistant imports, no UI, no opinion about how the state should be surfaced. The [`ha-lumagen`](https://github.com/frankrosano/ha-lumagen) custom integration consumes it.
 
-Transport is handled by [`serialx`](https://github.com/puddly/serialx), so aiolumagen talks to a Lumagen over whatever URL scheme serialx supports — direct USB/RS-232, raw TCP (ser2net), or an ESPHome `serial_proxy` (see [`esphome-lumagen`](../esphome-lumagen)).
+Transport is handled by [`serialx`](https://github.com/puddly/serialx), so aiolumagen talks to a Lumagen over whatever URL scheme serialx supports — direct USB/RS-232, raw TCP (ser2net), or an ESPHome `serial_proxy` (see the `esphome-lumagen` firmware).
 
 > **Formerly `pylumagen`.** This project was renamed to `aiolumagen` (see [Status](#status)) to avoid a naming collision with an unrelated `pylumagen` package already published on PyPI.
 
@@ -491,11 +491,14 @@ a live ESPHome bridge.
 
 ## Status
 
-Alpha / prototype. Not yet published to PyPI — install from git:
+Alpha / prototype. Published on [PyPI](https://pypi.org/project/aiolumagen/):
 
+```bash
+pip install aiolumagen
 ```
-aiolumagen @ git+https://github.com/frankrosano/aiolumagen.git@v0.8.0
-```
+
+Releases are published by the `Publish` workflow when a `v*` tag is pushed;
+the tag must match `version` in `pyproject.toml`.
 
 The normal-mode client is safe to experiment with. **Firmware updating is not** —
 read the warning at the top of [Firmware updates](#firmware-updates) first. This
@@ -503,4 +506,4 @@ project is independent of Lumagen, Inc. and carries no warranty.
 
 ## License
 
-MIT. See [`LICENSE`](LICENSE).
+MIT. See [`LICENSE`](https://github.com/frankrosano/aiolumagen/blob/main/LICENSE).
