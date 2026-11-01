@@ -217,6 +217,9 @@ class LumagenClient:
         self._reconnect_delay = self.RECONNECT_BACKOFF_INITIAL
         self._next_reconnect_at = 0.0
         self._reconnect_failures = 0
+        # Set while an announced outage is in progress, so the handshakes of
+        # its reconnect attempts don't each log another warning.
+        self._link_lost = False
         # Response-code -> futures awaiting that code. Populated by
         # _register_waiter and drained by _on_response; see the
         # "Request/response correlation" section below.
@@ -1120,7 +1123,7 @@ class LumagenClient:
                 # it lands, so a dead link costs one command, not five.
                 await self.query_device_info(timeout=retry_interval)
             except LumagenConnectionError:
-                _LOGGER.warning("Lumagen startup queries aborted - transport disconnected")
+                self._handshake_log("Lumagen startup queries aborted - transport disconnected")
                 return False
             except TimeoutError:
                 if attempt < max_retries - 1:
@@ -1149,27 +1152,55 @@ class LumagenClient:
                     Query.FULL_STATUS_V5.value, timeout=self.FULL_STATUS_WAIT
                 )
             except LumagenConnectionError:
-                _LOGGER.warning("Lumagen startup queries aborted - transport disconnected")
+                self._handshake_log("Lumagen startup queries aborted - transport disconnected")
                 # !S01 already landed, so device info is current; the rest is
                 # the next handshake's job once the link is back.
                 return True
             except TimeoutError:
-                status = ""
+                status = None
             # The Full v5 push doesn't carry sharpness / game mode / auto
             # aspect / HDR-mapping state — pull those once now so entities
             # don't sit at "unknown" until the first poll.
             await self._query_secondary_status()
-            if not status:
+            # No reply at all is only firmware's fault if the device is still
+            # talking; a link that dropped mid-handshake loses replies too.
+            if status == "" or (status is None and await self._device_still_answers()):
                 self._warn_no_full_status()
+            elif status is None:
+                _LOGGER.debug(
+                    "No Full v5 status during startup, and the Lumagen stopped answering; "
+                    "treating it as a link problem, not missing firmware support"
+                )
             return True
 
-        _LOGGER.warning(
+        self._handshake_log(
             "Lumagen startup handshake: no response after %d attempts "
             "(%.0fs total). The poll loop will continue trying.",
             max_retries,
             max_retries * retry_interval,
         )
         return False
+
+    def _handshake_log(self, message: str, *args: object) -> None:
+        """Warn about a failed handshake, unless it's part of an announced outage.
+
+        An outage is announced once ("now unavailable") and its first failed
+        reconnect once; a handshake per later attempt would add a warning each
+        time, up to a dozen an hour for an outage that lasts.
+        """
+        (_LOGGER.debug if self._link_lost else _LOGGER.warning)(message, *args)
+
+    async def _device_still_answers(self) -> bool:
+        """Whether the Lumagen answers a power query right now.
+
+        Tells firmware without Full v5 (answers everything but ``ZQI25``)
+        from a link that went quiet during the handshake (answers nothing).
+        """
+        try:
+            await self.query_and_wait(Query.POWER.value, timeout=self.FULL_STATUS_WAIT)
+        except TimeoutError, LumagenConnectionError:
+            return False
+        return True
 
     def _warn_no_full_status(self) -> None:
         """Warn that the device identified itself but never reported status.
@@ -1317,6 +1348,7 @@ class LumagenClient:
         """Announce the outage once, then attempt a reconnect if backoff allows."""
         if self._available:
             self._available = False
+            self._link_lost = True
             _LOGGER.warning("Lumagen is now unavailable (%s), reconnecting", reason)
             self._notify_listeners(("_unavailable",))
             # Anything still awaiting a reply is waiting on a subscription
@@ -1374,6 +1406,7 @@ class LumagenClient:
         recovered = not self._available
         if recovered:
             self._available = True
+            self._link_lost = False
             if self._reconnect_failures:
                 _LOGGER.info(
                     "Lumagen is now available again after %d failed reconnect attempt(s)",

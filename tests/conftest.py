@@ -54,6 +54,10 @@ class FakeTransport:
         """Make the next N :meth:`connect` calls raise, like an unreachable bridge."""
         self.silent = False
         """Stop auto-answering the handshake — a half-open or unpowered link."""
+        self.answers_full_status = True
+        """Answer ``ZQI25``; off simulates firmware without Full v5."""
+        self.answers_power = False
+        """Answer ``ZQS02`` (off by default: tests set power themselves)."""
 
     @property
     def connected(self) -> bool:
@@ -92,8 +96,10 @@ class FakeTransport:
         # status windows in every test.
         if data == b"ZQS01":
             self._on_data(S01_RESPONSE)
-        elif data == b"ZQI25":
+        elif data == b"ZQI25" and self.answers_full_status:
             self._on_data(I25_RESPONSE)
+        elif data == b"ZQS02" and self.answers_power:
+            self._on_data(b"!S02,1\r\n")
 
     def feed(self, data: bytes | str) -> None:
         """Simulate inbound bytes from the Lumagen."""

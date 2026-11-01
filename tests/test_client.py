@@ -1565,3 +1565,54 @@ async def test_show_aspect_and_save_config_write_with_cr(
     await client.show_aspect()
     await client.save_config()
     assert fake_transport.sent == [b"ZY811\r", b"ZY6SAVECONFIG\r"]
+
+
+_NO_FULL_V5 = "returned no Full v5 status"
+
+
+@pytest.mark.parametrize(("still_answers", "warns"), [(True, True), (False, False)])
+async def test_missing_full_status_blames_firmware_only_if_the_device_still_answers(
+    fake_transport: FakeTransport,
+    caplog: pytest.LogCaptureFixture,
+    still_answers: bool,
+    warns: bool,
+) -> None:
+    """Regression: a link that dropped mid-handshake was told to update its firmware.
+
+    Firmware without Full v5 answers everything but ZQI25, so the power query
+    still gets a reply. A link that went quiet answers nothing, and that is
+    not a firmware problem.
+    """
+    fake_transport.answers_full_status = False
+    fake_transport.answers_power = still_answers
+    c = LumagenClient(fake_transport, power_poll_interval=None, status_poll_interval=None)
+    await c.start()
+    await c.stop()
+    assert (_NO_FULL_V5 in caplog.text) is warns
+
+
+async def test_reconnect_attempts_dont_each_log_a_warning(
+    fake_transport: FakeTransport, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An outage logs "now unavailable" and its first failed reconnect, nothing per attempt.
+
+    Each attempt's handshake used to warn "no response after 2 attempts" as
+    well: up to a dozen warnings an hour for an outage at the 300 s backoff cap.
+    """
+    c = _FastReconnectClient(
+        fake_transport,
+        power_poll_interval=0.05,
+        status_poll_interval=None,
+        stale_timeout=0.3,
+    )
+    await c.start()
+    caplog.clear()
+    fake_transport.silent = True
+    await _wait_until(lambda: c._reconnect_failures >= 2, timeout=20.0)
+    fake_transport.silent = False
+    await _wait_until(lambda: c.available, timeout=10.0)
+    await c.stop()
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 2, warnings
+    assert warnings[0].startswith("Lumagen is now unavailable")
+    assert "reconnect failed (attempt 1)" in warnings[1]
