@@ -40,6 +40,7 @@ from aiolumagen.firmware.container import (
     parse_container,
 )
 from aiolumagen.firmware.protocol import BOOT_SECTOR_LEN, FirmwareRevision
+from aiolumagen.firmware.releases import MAX_UPDATER_EXE_BYTES
 
 SECTION0: Final = "section0"
 SECTION1: Final = "section1"
@@ -200,6 +201,10 @@ class FirmwareBundle:
 
 
 def _pe_header_offset(data: bytes) -> int:
+    if len(data) > MAX_UPDATER_EXE_BYTES:
+        raise LumagenFirmwareImageError(
+            f"updater exceeds the {MAX_UPDATER_EXE_BYTES}-byte extraction limit"
+        )
     if len(data) < 0x40 or data[:2] != b"MZ":
         raise LumagenFirmwareImageError(
             "not a Windows executable (no 'MZ' signature). Supply the vendor's "
@@ -210,6 +215,14 @@ def _pe_header_offset(data: bytes) -> int:
         raise LumagenFirmwareImageError(
             "file has an MZ stub but no PE header; it may be truncated or a 16-bit executable."
         )
+    opt_size = _u16(data, pe + 20)
+    if opt_size < 120 or pe + 24 + opt_size > len(data):
+        raise LumagenFirmwareImageError("truncated or unsupported PE optional header")
+    if _u16(data, pe + 4) != 0x014C or _u16(data, pe + 24) != 0x010B:
+        raise LumagenFirmwareImageError("updater must be a 32-bit x86 PE executable")
+    directories = _u32(data, pe + 24 + 92)
+    if not 3 <= directories <= (opt_size - 96) // 8:
+        raise LumagenFirmwareImageError("invalid PE data-directory count")
     return pe
 
 
@@ -219,11 +232,15 @@ def pe_sections(data: bytes) -> list[PeSection]:
     count = _u16(data, pe + 6)
     opt_size = _u16(data, pe + 20)
     base = pe + 24 + opt_size
+    if not 1 <= count <= 96 or base + count * 40 > len(data):
+        raise LumagenFirmwareImageError("invalid or truncated PE section table")
     sections: list[PeSection] = []
     for index in range(count):
         entry = base + index * 40
-        if entry + 40 > len(data):
-            break
+        raw_size = _u32(data, entry + 16)
+        raw_address = _u32(data, entry + 20)
+        if raw_size and (raw_address < base + count * 40 or raw_address + raw_size > len(data)):
+            raise LumagenFirmwareImageError("PE section raw data is truncated or overlaps headers")
         sections.append(
             PeSection(
                 name=data[entry : entry + 8].rstrip(b"\x00").decode("ascii", "replace"),
@@ -233,6 +250,30 @@ def pe_sections(data: bytes) -> list[PeSection]:
                 raw_address=_u32(data, entry + 20),
             )
         )
+    for index, section in enumerate(sections):
+        if section.virtual_address + section.span > 0x100000000:
+            raise LumagenFirmwareImageError("PE section virtual range overflows")
+        for previous in sections[:index]:
+            if (
+                section.raw_size
+                and previous.raw_size
+                and max(section.raw_address, previous.raw_address)
+                < min(
+                    section.raw_address + section.raw_size,
+                    previous.raw_address + previous.raw_size,
+                )
+            ):
+                raise LumagenFirmwareImageError("overlapping PE raw sections")
+            if (
+                section.span
+                and previous.span
+                and max(section.virtual_address, previous.virtual_address)
+                < min(
+                    section.virtual_address + section.span,
+                    previous.virtual_address + previous.span,
+                )
+            ):
+                raise LumagenFirmwareImageError("overlapping PE virtual sections")
     return sections
 
 
@@ -250,7 +291,7 @@ def va_to_offset(data: bytes, va: int) -> int | None:
     base = pe_image_base(data)
     for section in pe_sections(data):
         start = base + section.virtual_address
-        if start <= va < start + section.span:
+        if start <= va < start + section.raw_size:
             return section.raw_address + (va - start)
     return None
 
@@ -258,7 +299,7 @@ def va_to_offset(data: bytes, va: int) -> int | None:
 def rva_to_offset(data: bytes, rva: int) -> int | None:
     """Map a relative virtual address to a file offset, or ``None``."""
     for section in pe_sections(data):
-        if section.virtual_address <= rva < section.virtual_address + section.span:
+        if section.virtual_address <= rva < section.virtual_address + section.raw_size:
             return section.raw_address + (rva - section.virtual_address)
     return None
 
@@ -269,6 +310,10 @@ def _walk_resource_dir(
     dir_off: int,
     path: tuple[int, ...],
     depth: int = 0,
+    *,
+    end: int,
+    visited: set[int],
+    budget: list[int],
 ) -> Iterator[tuple[tuple[int, ...], int, int]]:
     """Yield ``(path, data_rva, size)`` for every leaf in the resource tree.
 
@@ -277,49 +322,82 @@ def _walk_resource_dir(
     against a malformed file looping this forever — a real tree is never deeper
     than three.
     """
-    if depth > 3:
-        return
+    if depth > 3 or dir_off in visited:
+        raise LumagenFirmwareImageError("cyclic, shared or excessively deep PE resource directory")
+    visited.add(dir_off)
     base = rsrc_off + dir_off
-    if base + 16 > len(data):
-        return
+    if base + 16 > end:
+        raise LumagenFirmwareImageError("truncated PE resource directory")
     named = _u16(data, base + 12)
     ids = _u16(data, base + 14)
+    budget[0] += named + ids
+    if budget[0] > 4096 or base + 16 + (named + ids) * 8 > end:
+        raise LumagenFirmwareImageError("oversized or truncated PE resource entry table")
     for index in range(named + ids):
         entry = base + 16 + index * 8
-        if entry + 8 > len(data):
-            return
         name_or_id = _u32(data, entry)
         offset = _u32(data, entry + 4)
         is_dir = bool(offset & 0x80000000)
         offset &= 0x7FFFFFFF
-        entry_id = name_or_id & 0x7FFFFFFF
+        entry_id = -1 if name_or_id & 0x80000000 else name_or_id
         if is_dir:
-            yield from _walk_resource_dir(data, rsrc_off, offset, (*path, entry_id), depth + 1)
+            yield from _walk_resource_dir(
+                data,
+                rsrc_off,
+                offset,
+                (*path, entry_id),
+                depth + 1,
+                end=end,
+                visited=visited,
+                budget=budget,
+            )
             continue
         leaf = rsrc_off + offset
-        if leaf + 8 > len(data):
-            continue
+        if leaf + 16 > end:
+            raise LumagenFirmwareImageError("truncated PE resource data entry")
         yield (*path, entry_id), _u32(data, leaf), _u32(data, leaf + 4)
 
 
 def extract_resources(data: bytes) -> dict[int, bytes]:
     """Return ``{resource_id: bytes}`` for every ``RT_RCDATA`` resource."""
     pe = _pe_header_offset(data)
+    sections = pe_sections(data)
     rsrc_rva = _u32(data, pe + 24 + 112)  # DataDirectory[2] — the resource table
     if not rsrc_rva:
         return {}
     rsrc_off = rva_to_offset(data, rsrc_rva)
     if rsrc_off is None:
-        return {}
+        raise LumagenFirmwareImageError("PE resource directory has no file-backed section")
+    rsrc_size = _u32(data, pe + 24 + 116)
+    section = next(s for s in sections if s.raw_address <= rsrc_off < s.raw_address + s.raw_size)
+    if not rsrc_size or rsrc_off + rsrc_size > section.raw_address + section.raw_size:
+        raise LumagenFirmwareImageError("PE resource directory exceeds its raw section")
 
     found: dict[int, bytes] = {}
-    for path, rva, size in _walk_resource_dir(data, rsrc_off, 0, ()):
+    total = 0
+    for path, rva, size in _walk_resource_dir(
+        data, rsrc_off, 0, (), end=rsrc_off + rsrc_size, visited=set(), budget=[0]
+    ):
         if not path or path[0] != RT_RCDATA or len(path) < 2:
             continue
         offset = rva_to_offset(data, rva)
-        if offset is None or offset + size > len(data):
-            continue
-        found[path[1]] = data[offset : offset + size]
+        backing = next(
+            (s for s in sections if s.virtual_address <= rva < s.virtual_address + s.raw_size),
+            None,
+        )
+        if (
+            offset is None
+            or backing is None
+            or (rva - backing.virtual_address + size > backing.raw_size)
+        ):
+            raise LumagenFirmwareImageError("PE resource payload exceeds its file-backed section")
+        total += size
+        if total > MAX_UPDATER_EXE_BYTES:
+            raise LumagenFirmwareImageError("PE resource expansion exceeds the extraction limit")
+        blob = data[offset : offset + size]
+        if path[1] in found and found[path[1]] != blob:
+            raise LumagenFirmwareImageError("conflicting firmware resources for one resource id")
+        found[path[1]] = blob
     return found
 
 
@@ -355,7 +433,7 @@ def find_swdata_descriptor(data: bytes) -> tuple[int, int] | None:
     code = data[text.raw_address : text.raw_address + text.raw_size]
     base = pe_image_base(data)
     data_lo = base + data_sec.virtual_address
-    data_hi = data_lo + data_sec.span
+    data_hi = data_lo + data_sec.raw_size
 
     needle = b"\x10\x02\x00\x00"  # disp32 == 0x00000210
     pos = 0

@@ -172,12 +172,7 @@ class TestOnly:
                     source="fallback constants",
                     descriptor_recovered=False,
                 ),
-                SECTION1: FirmwareImage(
-                    name=SECTION1,
-                    payload=b"payload" * 512,
-                    source="test",
-                    container=None,
-                ),
+                SECTION1: make_bundle().images[SECTION1],
             }
         )
         plan = plan_update(bundle, only=[SECTION1])

@@ -28,6 +28,7 @@ offset 0. That's the same rule :mod:`aiolumagen.protocol` follows for ``!``.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Final
 
@@ -104,6 +105,10 @@ payload is verified — which is what
 :meth:`~aiolumagen.firmware.session.FirmwareSession.stage_image`'s
 ``header_last`` does, and why it defaults on.
 """
+
+FLASH_SIZE: Final = 0x1000000
+SECTION0_MAX_WIRE_SIZE: Final = min(s.address for s in SECTION1_SLOTS.values()) - ADDR_LIVE
+SECTION1_MAX_WIRE_SIZE: Final = FLASH_SIZE - max(s.address for s in SECTION1_SLOTS.values())
 
 
 def other_slot(code: str) -> Section1Slot | None:
@@ -273,6 +278,8 @@ Worth doing first: in standby the Lumagen doesn't service the updater command
 set at all, so ``M0931`` and everything after it time out with no indication of
 why.
 """
+
+CMD_DEVICE_INFO: Final = "ZQS01"
 
 REPLY_OK: Final = "Ok"
 REPLY_ERASE_DONE: Final = "OK"
@@ -444,15 +451,12 @@ def parse_identity(text: str) -> DeviceIdentity | None:
     dot-separated triple rather than trusting position.
     """
     for candidate in text.replace("\r", " ").replace("\n", " ").split():
-        parts = candidate.strip().split(".")
-        if len(parts) < 3:
+        if re.fullmatch(r"[0-9A-Fa-f]{6}\.[0-9A-Fa-f]{2}\.[0-9A-Fa-f]{4}", candidate) is None:
             continue
-        try:
-            revision_raw = int(parts[0], 16)
-            device_id = int(parts[1], 16)
-            serial = int(parts[2], 16)
-        except ValueError:
-            continue
+        parts = candidate.split(".")
+        revision_raw = int(parts[0], 16)
+        device_id = int(parts[1], 16)
+        serial = int(parts[2], 16)
         return DeviceIdentity(
             revision_raw=revision_raw,
             device_id=device_id,
@@ -472,11 +476,10 @@ def parse_checksum(text: str) -> int | None:
     """
     if CHECKSUM_PREFIX not in text:
         return None
-    digits = text.split(CHECKSUM_PREFIX, 1)[1][:8].strip()
-    try:
-        return int(digits, 16)
-    except ValueError:
+    field = text.split(CHECKSUM_PREFIX, 1)[1][:8]
+    if len(field) != 8 or re.fullmatch(r" *[0-9A-Fa-f]+", field) is None:
         return None
+    return int(field, 16)
 
 
 def decode_hex_reply(line: bytes) -> bytes | None:

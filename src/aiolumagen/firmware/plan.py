@@ -34,7 +34,12 @@ from enum import StrEnum
 from typing import Final
 
 from aiolumagen.exceptions import LumagenFirmwareImageError
-from aiolumagen.firmware.container import HEADER_LEN, ContainerHeader, expected_stored_checksum
+from aiolumagen.firmware.container import (
+    HEADER_LEN,
+    ContainerHeader,
+    expected_stored_checksum,
+    parse_container,
+)
 from aiolumagen.firmware.extract import (
     CHIP_NAMES,
     SECTION0,
@@ -44,8 +49,11 @@ from aiolumagen.firmware.extract import (
 )
 from aiolumagen.firmware.protocol import (
     BLOCK_DELAY,
+    BOOT_SECTOR_LEN,
     CHECKPOINT_SETTLE,
     POST_ERASE_DELAY,
+    SECTION0_MAX_WIRE_SIZE,
+    SECTION1_MAX_WIRE_SIZE,
     DeviceIdentity,
     FirmwareRevision,
     blocks_for,
@@ -338,6 +346,15 @@ def _plan_section0(bundle: FirmwareBundle) -> PlannedSection:
             "varies between releases, and writing the wrong one would flash a "
             "truncated or over-long image. Refusing to plan an update from it."
         )
+    if (
+        image.name != SECTION0
+        or image.container is not None
+        or not (BOOT_SECTOR_LEN < image.size <= BOOT_SECTOR_LEN + SECTION0_MAX_WIRE_SIZE)
+    ):
+        raise LumagenFirmwareImageError(
+            "section0 must contain a boot sector followed by nonempty CPU firmware "
+            "that fits before the first section-1 slot"
+        )
     return PlannedSection(
         name=SECTION0,
         action=SectionAction.WRITE,
@@ -365,6 +382,13 @@ def _plan_section1(
     image = bundle.section1
     if image is None:
         return None
+    if image.name != SECTION1 or image.container is None:
+        raise LumagenFirmwareImageError("section1 must be a validated shipped container")
+    container = parse_container(image.wire_bytes, name=SECTION1)
+    if container.payload != image.payload or container.raw != image.wire_bytes:
+        raise LumagenFirmwareImageError("section1 container and image bytes disagree")
+    if not container.payload or len(container.raw) > SECTION1_MAX_WIRE_SIZE:
+        raise LumagenFirmwareImageError("section1 is empty or exceeds the smaller A/B slot")
 
     if force:
         return PlannedSection(

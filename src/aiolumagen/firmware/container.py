@@ -142,7 +142,7 @@ def parse_container(blob: bytes, *, name: str = "image") -> Container:
 
     Strict, because this only ever runs against a file the user supplied and a
     bad file is the one failure mode that is completely free to catch. Requires
-    the magic, an unstamped ``tag``, a ``size`` that fits, and a payload whose
+    the magic, an unstamped ``tag``, an exact ``size``, and a payload whose
     additive sum matches the recorded checksum.
 
     The unstamped-``tag`` requirement is what distinguishes a *shipped* container
@@ -175,6 +175,11 @@ def parse_container(blob: bytes, *, name: str = "image") -> Container:
             f"{name}: container declares {header.size} payload bytes but only "
             f"{available} are present"
         )
+    if header.size < available:
+        raise LumagenFirmwareImageError(
+            f"{name}: container declares {header.size} payload bytes but "
+            f"{available} are present; refusing to discard trailing image bytes"
+        )
     payload = blob[HEADER_LEN : HEADER_LEN + header.size]
     container = Container(
         header=header,
@@ -206,13 +211,31 @@ def find_containers(data: bytes) -> list[tuple[int, Container]]:
     """
     found: list[tuple[int, Container]] = []
     start = 0
+    attempts = 0
+    scanned_bytes = 0
     while True:
         idx = data.find(MAGIC_BYTES, start)
         if idx < 0:
             return found
         start = idx + 1
+        attempts += 1
+        if attempts > 4096:
+            raise LumagenFirmwareImageError("too many container candidates in the scan")
+        header = ContainerHeader.unpack(data[idx : idx + HEADER_LEN])
+        if header is None or header.size > len(data) - idx - HEADER_LEN:
+            continue
+        scanned_bytes += HEADER_LEN + header.size
+        if scanned_bytes > 32 * 1024 * 1024:
+            raise LumagenFirmwareImageError("container scan exceeds the verification byte budget")
         try:
-            found.append((idx, parse_container(data[idx:], name=f"offset {idx:#x}")))
+            found.append(
+                (
+                    idx,
+                    parse_container(
+                        data[idx : idx + HEADER_LEN + header.size], name=f"offset {idx:#x}"
+                    ),
+                )
+            )
         except LumagenFirmwareImageError:
             continue
 

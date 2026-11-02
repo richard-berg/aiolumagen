@@ -90,6 +90,7 @@ from aiolumagen.firmware.protocol import (
     FirmwareRevision,
 )
 from aiolumagen.firmware.releases import (
+    MAX_UPDATER_EXE_BYTES,
     RELEASES_URL,
     LumagenReleaseIndexError,
     ReleaseChannel,
@@ -166,8 +167,18 @@ async def load_updater(source: str | Path | bytes) -> FirmwareBundle:
     if isinstance(source, bytes):
         return extract_images(source)
     path = Path(source)
+
+    def read_bounded() -> bytes:
+        with path.open("rb") as stream:
+            data = stream.read(MAX_UPDATER_EXE_BYTES + 1)
+        if len(data) > MAX_UPDATER_EXE_BYTES:
+            raise LumagenFirmwareImageError(
+                f"updater exceeds the {MAX_UPDATER_EXE_BYTES}-byte extraction limit"
+            )
+        return data
+
     try:
-        data = await asyncio.to_thread(path.read_bytes)
+        data = await asyncio.to_thread(read_bounded)
     except OSError as err:
         raise LumagenFirmwareImageError(f"could not read {path}: {err}") from err
     return extract_images(data, source_name=path.name)
@@ -183,6 +194,8 @@ async def update_firmware(
     force: bool = False,
     only: Iterable[str] | None = None,
     progress: ProgressCallback | None = None,
+    expected_model_number: str | None = None,
+    expected_serial: str | None = None,
 ) -> UpdateResult:
     """Update a Lumagen's firmware from a vendor updater EXE.
 
@@ -203,6 +216,9 @@ async def update_firmware(
         ``["section1"]``. For deliberate single-section flashes.
     :param progress: optional callable taking an
         :class:`~aiolumagen.firmware.session.UpdateProgress`.
+    :param expected_model_number: pin a fresh normal-mode ``!S01`` model number.
+    :param expected_serial: pin a fresh nonzero normal-mode ``!S01`` serial;
+        None, empty, and all-zero values do not pin serial.
     :raises LumagenFirmwareImageError: the EXE is unusable, or `only` names
         something unwritable. Nothing was contacted.
     :raises LumagenFirmwareAbortError: a safety gate refused, or the run stopped
@@ -216,6 +232,8 @@ async def update_firmware(
     new firmware gets loaded.
     """
     bundle = await load_updater(source)
+    selected = tuple(only) if only is not None else None
+    plan_update(bundle, force=force, only=selected)
     async with FirmwareSession(url, baudrate=SESSION_BAUD) as session:
         return await session.run_update(
             bundle,
@@ -223,6 +241,8 @@ async def update_firmware(
             dry_run=dry_run,
             promote=promote,
             force=force,
-            only=only,
+            only=selected,
             progress=progress,
+            expected_model_number=expected_model_number,
+            expected_serial=expected_serial,
         )

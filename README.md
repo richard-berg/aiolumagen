@@ -262,6 +262,15 @@ just to a promotion:
 | dry run / already up to date | ❌ | ❌ | `X` |
 | **failed after section 1 committed** | ❌ | ❌ | `X` + warning |
 
+`UpdateResult.powered_down` describes the intended successful exit, not observed
+power state: `run_update()` returns before context cleanup. Likewise, `DONE`
+precedes hand-back. Cleanup is best-effort, but a hand-back/close failure on an
+otherwise successful context exit now raises `LumagenFirmwareError` instead of
+returning a success-shaped outcome. Existing body errors and cancellations are
+preserved. Integrations must wait for the `async with` to exit successfully and
+confirm actual device state separately rather than treating these fields as
+telemetry; even successful `Z97` delivery is not a physical power-state ACK.
+
 That last row matters. A committed section-1 slot is elected at the *next* boot,
 so after a partial update the unit is still running its old, self-consistent
 firmware. Leaving it powered on keeps it that way and reachable for a retry that
@@ -411,6 +420,52 @@ each, then a promotion, and section 1 last.
   library that can leave a device unbootable.
 
 ### Validation status
+
+#### Input and cancellation safety
+
+The updater is parsed as data, never executed. Extraction limits EXEs to 32 MiB,
+compressed zips to 33 MiB, archives to 64 members, and PE resource traversal to
+4,096 entries. Cyclic resource graphs, truncated or non-file-backed ranges,
+inconsistent containers, and images that exceed their flash regions are refused.
+Section 0 must include its boot sector **and** nonempty CPU firmware; the boot
+sector is never transferred. Section 1 must fit both A/B slots (4 MiB maximum).
+These checks do **not** authenticate a release: additive checksums are not
+cryptographic signatures. Only supply firmware from a trusted source.
+
+Every session checks a fresh Radiance Pro identity, including when given a
+pre-built plan. A plan with a recorded identity must match the connected device.
+To pin the selected unit across the normal-client/firmware-session handoff:
+
+```python
+async with FirmwareSession(url) as session:
+    result = await session.run_update(
+        bundle,
+        expected_model_number=selected_state.model_number,
+        expected_serial=selected_state.serial,
+    )
+# Only now has the hand-back succeeded.
+```
+
+Both optional keyword arguments are also accepted by `update_firmware()`.
+They compare a fresh normal-mode `ZQS01` reply **before entering updater mode**;
+the normal model number (e.g. `"1018"`) is not the updater `I` device-family ID
+(`0x16`). A known nonzero decimal serial must match a fresh nonzero serial,
+ignoring leading zeros. `None`, empty, or all-zero expected serials are unknown:
+only the supplied model is pinned, so a same-model substitution cannot then be
+excluded. A missing, zero, or malformed fresh serial fails closed when a
+nonzero serial was expected.
+
+Post-commit section-1 verification must answer; a section-0 copy needs either
+its affirmative completion ACK or a matching live checksum, not silence.
+
+Cancellation completes an in-flight command before cleanup, waits for an
+outstanding erase/copy, and finishes an interrupted payload counter before
+restoring 9600 baud and leaving updater mode. Repeated cancellation does not
+abandon cleanup or owned transports. Cleanup is bounded and best-effort: a dead
+link or power loss cannot be made safe in software. An unconfirmed live write
+never requests a restart; **retry the update before power-cycling**.
+
+#### Hardware qualification
 
 The protocol was recovered by reverse-engineering the vendor updater, then this
 implementation was qualified on a **Lumagen Radiance Pro 4242** over an ESPHome

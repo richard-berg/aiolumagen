@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field, replace
@@ -69,6 +70,7 @@ from aiolumagen.firmware.protocol import (
     CMD_BOOTLOADER_PROBE,
     CMD_CHECKSUM,
     CMD_COPY,
+    CMD_DEVICE_INFO,
     CMD_ENTER_UPDATE,
     CMD_FINISH,
     CMD_FLASH_LAYOUT,
@@ -80,6 +82,7 @@ from aiolumagen.firmware.protocol import (
     CMD_SCRATCH_PROBE,
     DEFAULT_CHUNK,
     ERASE_TOKEN_TIMEOUT,
+    FLASH_SIZE,
     FLUSH_RETRY_DELAY,
     FLUSH_TIMEOUT,
     LIVE_PROBE_ADDRS,
@@ -90,9 +93,11 @@ from aiolumagen.firmware.protocol import (
     REPLY_OK,
     SCRATCH_ADDR,
     SCRATCH_SECTOR,
+    SECTION1_MAX_WIRE_SIZE,
     SECTION1_SLOTS,
     SECTOR_SIZE,
     SESSION_BAUD,
+    SUPPORTED_BAUDS,
     DeviceIdentity,
     Section1Slot,
     blocks_for,
@@ -120,6 +125,25 @@ A coarse timer rounds a 5.6 ms request up to its granularity, which turned a
 178 ms block into 512 ms during bring-up and built a silent backlog. The pacer
 accumulates debt instead and only sleeps when it exceeds this.
 """
+
+MAX_RX_BYTES: Final = 2 * SECTOR_SIZE + 2
+
+
+def _discard_data(_data: bytes) -> None:
+    pass
+
+
+async def _join_task(task: asyncio.Task[None]) -> None:
+    """Finish an atomic command/cleanup even if its caller is cancelled again."""
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+    task.result()
+    if cancelled:
+        raise asyncio.CancelledError
 
 
 def wire_time(nbytes: int, baudrate: int) -> float:
@@ -309,11 +333,13 @@ class UpdateResult:
     written: tuple[str, ...] = ()
     promoted: bool = False
     powered_down: bool = False
-    """Whether the session ended by powering the unit off with ``Z97``.
+    """Whether a successful context exit should power down with ``Z97``.
 
     True whenever anything was written that needs a restart to take effect — a
     promoted section 0 *or* a committed section-1 slot. Distinct from
     :attr:`promoted`, which is specifically about section 0's scratch-to-live copy.
+    This is intent, not telemetry: run_update returns before hand-back runs,
+    and hand-back is best-effort if the connection has failed.
     """
 
     dry_run: bool = False
@@ -332,6 +358,14 @@ class _Stats:
     flush_calls: int = 0
     flush_retries: int = 0
     notes: list[str] = field(default_factory=list)
+
+
+@dataclass
+class _EraseState:
+    expected: int
+    seen: int = 0
+    completion_started: bool = False
+    finished: bool = False
 
 
 class FirmwareSession:
@@ -381,7 +415,17 @@ class FirmwareSession:
         """
         if url is None and transport is None:
             raise LumagenFirmwareError("FirmwareSession needs either a url or a transport")
-        self._transport: Any = transport or LumagenTransport(url or "", baudrate=baudrate)
+        if not isinstance(chunk, int) or isinstance(chunk, bool) or chunk <= 0:
+            raise LumagenFirmwareError("chunk must be a positive integer")
+        if baudrate not in SUPPORTED_BAUDS:
+            raise LumagenFirmwareError(f"unsupported firmware baudrate: {baudrate}")
+        if not all(math.isfinite(v) and v >= 0 for v in (block_delay, flush_retry_delay)):
+            raise LumagenFirmwareError("firmware delays must be finite and nonnegative")
+        if not math.isfinite(flush_timeout) or flush_timeout <= 0:
+            raise LumagenFirmwareError("flush_timeout must be finite and positive")
+        self._transport: Any = (
+            transport if transport is not None else LumagenTransport(url or "", baudrate=baudrate)
+        )
         self._owns_transport = transport is None
         self.baudrate = baudrate
         self.chunk = min(chunk, MAX_SAFE_CHUNK)
@@ -391,6 +435,13 @@ class FirmwareSession:
         self.flush_retry_delay = flush_retry_delay
 
         self._buffer = bytearray()
+        self._rx_overflow = False
+        self._pending_baud: int | None = None
+        self._pending_payload = 0
+        self._erase_state: _EraseState | None = None
+        self._copy_pending = False
+        self._run_failed = False
+        self._hand_back_error: Exception | None = None
         self._pacer = _WirePacer(baudrate)
         self._stats = _Stats()
         self.flush_mode: str | None = None
@@ -435,16 +486,50 @@ class FirmwareSession:
         traceback: object,
     ) -> None:
         # Whether the body raised decides how to exit — see hand_back(failed=...).
-        await self.hand_back(failed=exc_type is not None)
-        await self.close()
+        cleanup_error: Exception | None = None
+
+        async def cleanup() -> None:
+            nonlocal cleanup_error
+            try:
+                async with asyncio.timeout(50.0):
+                    await self.hand_back(failed=exc_type is not None or self._run_failed)
+            except Exception as err:
+                cleanup_error = err
+                _LOGGER.warning("Firmware hand-back failed", exc_info=True)
+            finally:
+                try:
+                    await self.close()
+                except Exception as err:
+                    cleanup_error = cleanup_error or err
+                    _LOGGER.warning("Firmware transport close failed", exc_info=True)
+
+        await _join_task(asyncio.create_task(cleanup()))
+        error = cleanup_error or self._hand_back_error
+        if error is not None and exc_type is None and not self._run_failed:
+            raise LumagenFirmwareError(
+                f"firmware hand-back failed; device state is unconfirmed: {error}. "
+                "Do NOT assume a successful power-down or power-cycle the unit."
+            ) from error
 
     async def connect(self) -> None:
         self._transport.set_data_callback(self._feed)
-        await self._transport.connect()
+        try:
+            await self._transport.connect()
+        except BaseException:
+            try:
+                await _join_task(asyncio.create_task(self.close()))
+            except Exception:
+                _LOGGER.warning("Firmware connect rollback failed", exc_info=True)
+            raise
 
     async def close(self) -> None:
-        if self._owns_transport:
-            await self._transport.disconnect()
+        try:
+            if self._owns_transport:
+                await asyncio.wait_for(self._transport.disconnect(), timeout=5.0)
+        finally:
+            self._transport.set_data_callback(_discard_data)
+            self._buffer.clear()
+            self._progress = None
 
     async def hand_back(self, *, failed: bool = False) -> None:
         """Return the device to a state the next client can talk to.
@@ -453,10 +538,11 @@ class FirmwareSession:
             ``Z97`` power-down even when something was written, because a reboot is
             the *worst* next step after a partial update — see below.
 
-        Bounded and non-raising, and called from every exit path including
-        failures. Restores 9600 and leaves updater mode; a session that aborted
-        mid-write still has to do both, or the unit sits at 230400 in updater mode
-        answering nobody.
+        Bounded and non-raising when called directly; the context manager raises
+        a recorded cleanup failure on an otherwise successful exit. Called from
+        every exit path including failures. Restores 9600 and leaves updater
+        mode; a session that aborted mid-write still has to do both, or the unit
+        sits at 230400 in updater mode answering nobody.
 
         Which exit is used turns on :attr:`requires_restart` — whether anything was
         written that only takes effect on the next boot — **not** on whether a
@@ -505,14 +591,36 @@ class FirmwareSession:
         would reboot straight into a new section 1 paired with old CPU firmware,
         which is the one combination no vendor session ever produces.
         """
-        if self.exited or not self._transport.connected:
+        if self.exited:
+            return
+        if not self._transport.connected:
+            if self.entered_update_mode:
+                self._hand_back_error = LumagenFirmwareError(
+                    "connection lost before updater-mode exit could be delivered"
+                )
+                _LOGGER.warning("Firmware hand-back failed: %s", self._hand_back_error)
             return
         try:
+            failed = failed or self._run_failed
+            self._rx_overflow = False
+            if self._pending_baud is not None:
+                await self._set_transport_baud(self._pending_baud)
+            if self._erase_state is not None:
+                await self._await_erase(report_progress=False)
+            if self._copy_pending and not await self.await_promote_ack():
+                raise LumagenFirmwareError(
+                    "copy completion is unknown; do NOT power-cycle the unit"
+                )
+            if self._pending_payload:
+                if not await self.resync(self._pending_payload):
+                    raise LumagenFirmwareError("could not finish the interrupted payload counter")
+                self._pending_payload = 0
             if self.requires_restart and not failed:
                 if self.entered_update_mode:
                     await asyncio.wait_for(self.leave(finish=True), timeout=10.0)
                 if self.baudrate != SESSION_BAUD:
                     await self._set_transport_baud(SESSION_BAUD)
+                self._hand_back_error = None
                 return
 
             if self.requires_restart:
@@ -528,19 +636,37 @@ class FirmwareSession:
                 await asyncio.wait_for(self.set_baud(SESSION_BAUD, pings=2), timeout=30.0)
             if self.entered_update_mode:
                 await asyncio.wait_for(self.leave(finish=False), timeout=10.0)
+            self._hand_back_error = None
         except Exception as err:
+            self._hand_back_error = err
+            recovery = (
+                "Do NOT power-cycle: a live write may already have committed. "
+                "Restore the link and retry the update."
+                if self.requires_restart
+                else "Recover by disconnecting AC power, reconnecting, and powering on."
+            )
             _LOGGER.warning(
                 "Could not hand the device back cleanly: %s. It may still be in "
-                "updater mode at %d baud — recover by disconnecting AC power, "
-                "reconnecting, and powering on.",
+                "updater mode at %d baud. %s",
                 err,
                 self.baudrate,
+                recovery,
             )
 
     # -- framing primitives ------------------------------------------------
 
     def _feed(self, data: bytes) -> None:
+        if self._rx_overflow:
+            return
+        if len(self._buffer) + len(data) > MAX_RX_BYTES:
+            self._buffer.clear()
+            self._rx_overflow = True
+            return
         self._buffer += data
+
+    def _check_rx(self) -> None:
+        if self._rx_overflow:
+            raise LumagenFirmwareError("firmware receive buffer overflow; reply framing is lost")
 
     def _emit(self, progress: UpdateProgress) -> None:
         if self._overall is not None and progress.overall is None:
@@ -578,18 +704,28 @@ class FirmwareSession:
         the only framing ever validated against hardware, and the cost is one
         extra write per command.
         """
-        self.commands_sent.append(command)
-        raw = command.encode("ascii")
-        await self._write(raw[:1])
-        if len(raw) > 1:
-            await self._write(raw[1:])
+
+        async def write_command() -> None:
+            async with asyncio.timeout(10.0):
+                self.commands_sent.append(command)
+                raw = command.encode("ascii")
+                await self._write(raw[:1])
+                if len(raw) > 1:
+                    await self._write(raw[1:])
+
+        await _join_task(asyncio.create_task(write_command()))
 
     async def read_bytes(self, count: int, tries: int = 50, interval: float = 0.010) -> bytes:
         """Wait up to ``tries * interval`` for `count` bytes, then take what arrived."""
+        self._check_rx()
+        if count < 0 or count > MAX_RX_BYTES:
+            raise LumagenFirmwareError("firmware read size is outside the receive buffer limit")
         for _ in range(tries):
+            self._check_rx()
             if len(self._buffer) >= count:
                 break
             await asyncio.sleep(interval)
+        self._check_rx()
         if not self._buffer:
             return b""
         take = min(len(self._buffer), count)
@@ -610,14 +746,15 @@ class FirmwareSession:
         """
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            self._check_rx()
             if b"\r\n" in self._buffer:
                 break
             await asyncio.sleep(0.005)
         index = self._buffer.find(b"\r\n")
+        self._check_rx()
         if index < 0:
-            line = bytes(self._buffer)
             self._buffer.clear()
-            return line
+            return b""
         line = bytes(self._buffer[:index])
         del self._buffer[: index + 2]
         return line
@@ -695,10 +832,16 @@ class FirmwareSession:
                     "for 'Output pool full' and power-cycle the bridge."
                 )
             try:
-                status = await self._transport.flush(
-                    timeout=max(5.0, min(remaining, self.flush_timeout)),
-                    mode=self.flush_mode,
-                )
+                async with asyncio.timeout(remaining):
+                    status = await self._transport.flush(
+                        timeout=remaining,
+                        mode=self.flush_mode,
+                    )
+            except TimeoutError as err:
+                raise LumagenFirmwareAbortError(
+                    f"the proxy did not finish flushing {nbytes} byte(s) within "
+                    f"{self.flush_timeout:g}s"
+                ) from err
             except Exception as err:
                 # A broken barrier must not abort a fourteen-minute transfer by
                 # itself; a genuinely dead link will surface at the next command
@@ -751,6 +894,43 @@ class FirmwareSession:
 
     # -- device operations -------------------------------------------------
 
+    async def _check_expected_device(
+        self, expected_model_number: str | None, expected_serial: str | None
+    ) -> None:
+        model = expected_model_number.strip() if expected_model_number is not None else ""
+        serial = expected_serial.strip() if expected_serial is not None else ""
+        if serial and (not serial.isascii() or not serial.isdecimal()):
+            raise LumagenFirmwareError("expected_serial must be decimal digits or unknown")
+        serial = serial.lstrip("0")
+        if not model and not serial:
+            return
+
+        # S01's model number is not I's device-family ID. Pin the same
+        # normal-mode fields the selecting client actually observed.
+        await self.drain_rx()
+        await self.send(CMD_DEVICE_INFO)
+        line = (await self.read_line(timeout=1.5)).decode("ascii", "replace")
+        _, marker, payload = line.partition("!S01,")
+        parts = [part.strip() for part in payload.split(",")]
+        if not marker or len(parts) != 4:
+            raise LumagenFirmwareAbortError(
+                "could not read fresh device identity for the selected firmware target"
+            )
+        if model and parts[2] != model:
+            raise LumagenFirmwareAbortError(
+                f"fresh device model number {parts[2]!r} differs from selected model {model!r}"
+            )
+        if serial:
+            fresh_serial = parts[3]
+            if (
+                not fresh_serial.isascii()
+                or not fresh_serial.isdecimal()
+                or fresh_serial.lstrip("0") != serial
+            ):
+                raise LumagenFirmwareAbortError(
+                    "fresh device serial is unknown or differs from the selected unit"
+                )
+
     async def power_check(self) -> bool | None:
         """Normal-mode power state, queried *before* entering updater mode."""
         await self.drain_rx()
@@ -774,9 +954,9 @@ class FirmwareSession:
                 "subsequent command would time out without explaining why."
             )
 
+        self.entered_update_mode = True
         await self.send(CMD_ENTER_UPDATE)
         await self.read_bytes(2)  # CRLF, when entering from normal operation
-        self.entered_update_mode = True
         await self.drain_rx()
 
         await self.send(CMD_PING)
@@ -792,6 +972,10 @@ class FirmwareSession:
         if identity is None:
             raise LumagenFirmwareAbortError(
                 "the device did not answer the identify query. Nothing was written."
+            )
+        if not identity.is_radiance_pro:
+            raise LumagenFirmwareAbortError(
+                f"device reports {identity.model}, not a Radiance Pro. Nothing was written."
             )
         await self.drain_rx()
 
@@ -835,15 +1019,24 @@ class FirmwareSession:
 
     async def read_at(self, addr: int, size: int) -> bytes:
         """Read `size` bytes via ``R``. Reply is ASCII hex, CRLF-terminated."""
+        self._validate_range(addr, size)
+        if size > SECTOR_SIZE:
+            raise LumagenFirmwareError("read_at is limited to one flash sector per reply")
         await self.drain_rx()
         await self.send(set_address(addr))
         await self.send(set_length(size))
         await self.send(CMD_READ)
         line = await self.read_line(timeout=max(2.0, size * 2 * 0.002 + 1.0))
         try:
-            return bytes.fromhex(line.decode("ascii", "replace").strip())
+            decoded = bytes.fromhex(line.decode("ascii", "replace").strip())
+            return decoded if len(decoded) == size else b""
         except ValueError:
-            return line
+            return b""
+
+    @staticmethod
+    def _validate_range(addr: int, length: int) -> None:
+        if not 0 <= addr < FLASH_SIZE or not 0 <= length <= FLASH_SIZE - addr:
+            raise LumagenFirmwareError("firmware address/length is outside the flash map")
 
     async def read_container_header(self, addr: int) -> ContainerHeader | None:
         """Read and decode the 16-byte container header at `addr`."""
@@ -860,6 +1053,8 @@ class FirmwareSession:
         ``None`` means no answer, which mid-update usually means "still busy
         programming" rather than "wrong". Callers must not read it as a mismatch.
         """
+        self._validate_range(addr, length)
+        await self.drain_rx()
         await self.send(set_length(length))
         await self.send(set_address(addr))
         await self.send(CMD_CHECKSUM)
@@ -876,50 +1071,71 @@ class FirmwareSession:
         ``OK``. The settle afterwards is not padding — the vendor observes it and
         flash needs it.
         """
+        if sectors <= 0 or first_sector <= 0:
+            raise LumagenFirmwareError("erase must name positive sectors outside the bootloader")
+        self._validate_range(first_sector * SECTOR_SIZE, sectors * SECTOR_SIZE)
         await self.send(set_length(sectors))
-        await self.send(erase_run(first_sector))
+        self._erase_state = _EraseState(sectors)
+        try:
+            await self.send(erase_run(first_sector))
+            await self._await_erase()
+        except Exception:
+            self._erase_state = None
+            raise
 
-        seen = 0
+    async def _await_erase(self, *, report_progress: bool = True) -> None:
+        state = self._erase_state
+        if state is None:
+            return
         deadline = time.monotonic() + ERASE_TOKEN_TIMEOUT
-        done = False
-        while time.monotonic() < deadline:
+        while not state.finished and time.monotonic() < deadline:
             token = await self.read_bytes(1, tries=20, interval=0.05)
             if not token:
                 continue
             char = token.decode("ascii", "replace")
-            if char == "x":
-                seen += 1
-                self._advance(ProgressStep.ERASE, seen)
-                self._emit(
-                    UpdateProgress(
-                        phase=UpdatePhase.ERASING,
-                        message=f"erased sector {seen}/{sectors}",
-                        bytes_done=seen,
-                        bytes_total=sectors,
+            if state.completion_started:
+                if char != REPLY_ERASE_DONE[1]:
+                    raise LumagenFirmwareAbortError("erase returned a malformed completion token")
+                state.finished = True
+            elif char == "x":
+                state.seen += 1
+                if state.seen > state.expected:
+                    raise LumagenFirmwareAbortError("erase returned too many sector tokens")
+                if report_progress:
+                    self._advance(ProgressStep.ERASE, state.seen)
+                    self._emit(
+                        UpdateProgress(
+                            phase=UpdatePhase.ERASING,
+                            message=f"erased sector {state.seen}/{state.expected}",
+                            bytes_done=state.seen,
+                            bytes_total=state.expected,
+                        )
                     )
-                )
             elif char == REPLY_ERASE_DONE[0]:
-                if (await self.read_bytes(1)) == REPLY_ERASE_DONE[1:].encode():
-                    done = True
-                    break
-        if not done:
+                state.completion_started = True
+            elif char not in "\r\n":
+                raise LumagenFirmwareAbortError(f"erase returned an unexpected token {char!r}")
+        if not state.finished:
             raise LumagenFirmwareAbortError(
                 f"the erase did not report '{REPLY_ERASE_DONE}' within "
-                f"{ERASE_TOKEN_TIMEOUT:.0f}s ({seen}/{sectors} sectors seen)."
+                f"{ERASE_TOKEN_TIMEOUT:.0f}s ({state.seen}/{state.expected} sectors seen)."
             )
-        if seen != sectors:
+        if state.seen != state.expected:
             raise LumagenFirmwareAbortError(
-                f"the erase reported {seen} sector(s), expected {sectors}. Refusing "
+                f"the erase reported {state.seen} sector(s), expected {state.expected}. Refusing "
                 "to write into a region that may not be fully erased."
             )
 
         self.erased = True
         await asyncio.sleep(POST_ERASE_DELAY)
-        self._advance(ProgressStep.SETTLE, 1)
+        self._erase_state = None
+        if report_progress:
+            self._advance(ProgressStep.SETTLE, 1)
 
     async def _set_transport_baud(self, rate: int) -> None:
         await self._transport.set_baudrate(rate)
         self.baudrate = rate
+        self._pending_baud = None
         self._pacer.set_baud(rate)
 
     async def set_baud(self, rate: int, pings: int = 5) -> None:
@@ -933,9 +1149,12 @@ class FirmwareSession:
         exactly this reason — an unanswered ping means a failed rate change, and
         finding that out now beats discovering it halfway through a write.
         """
+        if rate not in SUPPORTED_BAUDS or pings < 1:
+            raise LumagenFirmwareError("unsupported firmware baudrate or empty ping check")
         if rate == self.baudrate:
             return
         previous = self.baudrate
+        self._pending_baud = rate
         await self.send(set_baud(rate))
         await asyncio.sleep(0.4)  # let 7 bytes clear the wire at the old rate
 
@@ -1064,6 +1283,7 @@ class FirmwareSession:
         """
         if chunk_blocks < 1:
             raise LumagenFirmwareError("chunk_blocks must be at least 1")
+        self._validate_range(base, len(image))
         total_blocks = blocks_for(len(image))
         bad: list[int] = []
         erased: list[int] = []
@@ -1157,6 +1377,9 @@ class FirmwareSession:
             bytes, and the answer is a lower rate rather than another attempt.
         :returns: the audit from the final pass. Check :attr:`AuditResult.ok`.
         """
+        if base % SECTOR_SIZE:
+            raise LumagenFirmwareError("repair base must be sector-aligned")
+        self._validate_range(base, len(image))
         blocks_per_sector = SECTOR_SIZE // BLOCK_SIZE
         total_blocks = blocks_for(len(image))
         result = await self.audit(image, base, chunk_blocks=chunk_blocks, skip_block0=skip_block0)
@@ -1189,8 +1412,10 @@ class FirmwareSession:
                         await self.send(set_length(len(payload)))
                         current_length = len(payload)
                     await self.send(set_address(base + offset))
+                    self._pending_payload = len(payload)
                     await self.send(CMD_BEGIN_BLOCK)
                     await self.write_raw(payload)
+                    self._pending_payload = 0
                     if self.block_delay:
                         await asyncio.sleep(self.block_delay)
 
@@ -1229,6 +1454,7 @@ class FirmwareSession:
         command: if it wedges the device, the header never lands and the unit
         boots exactly as before.
         """
+        self._validate_range(base, len(image))
         total = len(image)
         count = blocks_for(total)
         order = list(range(count))
@@ -1249,8 +1475,10 @@ class FirmwareSession:
                 await self.send(set_length(len(block)))
                 current_length = len(block)
             await self.send(set_address(base + offset))
+            self._pending_payload = len(block)
             await self.send(CMD_BEGIN_BLOCK)
             await self.write_raw(block)
+            self._pending_payload = 0
 
             # The one thing the barrier cannot cover: the device stops reading its
             # UART while programming a block, and anything arriving in that window
@@ -1270,12 +1498,21 @@ class FirmwareSession:
         once in an entire update — only here — which makes its presence a useful
         check that the sequence is right.
         """
+        if dest != ADDR_LIVE or source != SCRATCH_ADDR or length <= 0:
+            raise LumagenFirmwareError("promotion must copy nonempty scratch data to live firmware")
+        if length > min(slot.address for slot in SECTION1_SLOTS.values()) - ADDR_LIVE:
+            raise LumagenFirmwareError("promotion would overlap a section-1 slot")
+        self._validate_range(dest, length)
+        self._validate_range(source, length)
         await self.send(set_address(dest))
         await self.send(set_source_address(source))
         await self.send(set_length(length))
-        await self.send(CMD_COPY)
+        # Cancellation may arrive after G39 reached the device but before its
+        # paced send returns. Treat an attempted copy as irreversible.
         self.promoted = True
         self.requires_restart = True
+        self._copy_pending = True
+        await self.send(CMD_COPY)
 
     async def await_promote_ack(self, timeout: float = PROMOTE_ACK_TIMEOUT) -> bool:
         """Wait for ``G39``'s ``Ok``, which arrives when the internal copy finishes.
@@ -1288,7 +1525,10 @@ class FirmwareSession:
         ``OkCS=025baa``, which misparsed).
         """
         raw = await self.read_bytes(2, tries=max(1, int(timeout / 0.05)), interval=0.05)
-        return raw.decode("ascii", "replace") == REPLY_OK
+        acked = raw.decode("ascii", "replace") == REPLY_OK
+        if acked:
+            self._copy_pending = False
+        return acked
 
     async def leave(self, *, finish: bool) -> None:
         """Leave updater mode.
@@ -1310,6 +1550,8 @@ class FirmwareSession:
         header so the read is independent of any candidate image.
         """
         identity = parse_identity(await self._identify_raw())
+        if identity is None or not identity.is_radiance_pro:
+            raise LumagenFirmwareAbortError("could not confirm a Radiance Pro identity")
         code = await self.flash_layout()
         target = SECTION1_SLOTS.get(code)
         live = other_slot(code) if target is not None else None
@@ -1318,7 +1560,11 @@ class FirmwareSession:
         checksum: int | None = None
         if live is not None:
             header = await self.read_container_header(live.address)
-            if header is not None and header.has_magic and 0 < header.size <= 0x400000:
+            if (
+                header is not None
+                and header.has_magic
+                and 0 < header.size <= SECTION1_MAX_WIRE_SIZE - HEADER_LEN
+            ):
                 checksum = await self.device_checksum(
                     live.address, HEADER_LEN + header.size, timeout=60.0
                 )
@@ -1399,6 +1645,9 @@ class FirmwareSession:
 
         async def _checkpoint() -> None:
             await self._precommit_checkpoint(target.address, image)
+            # From the first commit byte onward even cancellation is an
+            # unconfirmed live-slot write, not a safely discarded scratch stage.
+            self.requires_restart = True
 
         await self._stage_with_progress(
             image, target.address, SECTION1, header_last=True, before_header=_checkpoint
@@ -1430,7 +1679,12 @@ class FirmwareSession:
         # unstamped tag the correction is a no-op and this reduces to the raw sum.
         expected = expected_stored_checksum(image, header.tag)
         got = await self.device_checksum(target.address, len(image), timeout=90.0)
-        if got is not None and got != expected:
+        if got is None:
+            raise LumagenFirmwareError(
+                "section 1: the commit header was written but its checksum could not "
+                "be confirmed. Do NOT power-cycle — re-run the update."
+            )
+        if got != expected:
             raise LumagenFirmwareError(
                 f"section 1: post-commit checksum {got:#010x}, expected "
                 f"{expected:#010x} (tag {header.tag:#010x}). The slot is committed "
@@ -1505,10 +1759,13 @@ class FirmwareSession:
         await self.drain_rx()
 
         payload_addr = addr + BLOCK_SIZE
-        payload_len = len(image) - BLOCK_SIZE
+        payload_len = max(0, len(image) - BLOCK_SIZE)
         expected = additive_checksum(image[BLOCK_SIZE:])
         got: int | None = None
         for attempt in range(1, CHECKPOINT_TRIES + 1):
+            if not payload_len:
+                got = expected
+                break
             got = await self.device_checksum(payload_addr, payload_len, timeout=90.0)
             if got is not None:
                 break
@@ -1580,13 +1837,8 @@ class FirmwareSession:
         await self.promote(ADDR_LIVE, SCRATCH_ADDR, len(image))
         acked = await self.await_promote_ack()
 
-        # Post-promotion reads are advisory, not a verdict. The unit powers itself
-        # down as soon as the copy completes, so a *missing* reply here is
-        # inconclusive rather than a failure — measured: G39 acked at t=11.32, the
-        # whole-region checksum answered at t=11.73, and every read from t=12.07
-        # returned nothing. Only a numeric mismatch proves the copy went wrong.
-        # An earlier version folded these reads into the verdict and reported
-        # "promotion did not verify" on byte-perfect firmware.
+        # An affirmative copy ACK permits an unavailable reread, but silence
+        # on both channels is not evidence that an irreversible copy finished.
         got = await self.device_checksum(ADDR_LIVE, len(image), timeout=30.0)
         expected = additive_checksum(image)
         if got is not None and got != expected:
@@ -1595,11 +1847,16 @@ class FirmwareSession:
                 f"expected {expected:#010x}. Do NOT power-cycle — re-run the update."
             )
         if got is None:
+            if not acked:
+                raise LumagenFirmwareError(
+                    "section 0: neither the promotion ACK nor the live checksum was "
+                    "received. Copy completion is unknown. Do NOT power-cycle."
+                )
             self._stats.notes.append(
-                "promotion completed but the device stopped answering before it could "
-                "be re-read, which is expected — it powers down as soon as the copy "
-                f"finishes (G39 ack: {'yes' if acked else 'not seen'})."
+                "promotion was acknowledged, but the live checksum could not be re-read."
             )
+        else:
+            self._copy_pending = False
 
     async def _stage_with_progress(
         self,
@@ -1667,6 +1924,8 @@ class FirmwareSession:
         only: Iterable[str] | None = None,
         plan: UpdatePlan | None = None,
         progress: ProgressCallback | None = None,
+        expected_model_number: str | None = None,
+        expected_serial: str | None = None,
     ) -> UpdateResult:
         """Preflight, plan, and write whatever the plan says needs writing.
 
@@ -1687,6 +1946,12 @@ class FirmwareSession:
         :param plan: a pre-built plan, which skips planning entirely. Mutually
             exclusive with `force` / `only`, since those are inputs to the
             planning this would replace.
+        :param expected_model_number: normal-mode ``!S01`` model-number field
+            from the selected unit. If supplied, a fresh ``ZQS01`` must match
+            before entering updater mode. This is not the updater ``I`` family ID.
+        :param expected_serial: normal-mode ``!S01`` decimal serial. A nonzero
+            value requires a fresh nonzero match; leading zeros are ignored.
+            None, empty, and all-zero values mean unknown and do not pin serial.
         """
         if plan is not None and (force or only is not None):
             raise LumagenFirmwareError(
@@ -1694,12 +1959,16 @@ class FirmwareSession:
                 "only are inputs to the planning that `plan` replaces, so honouring "
                 "both is ambiguous on an operation this destructive."
             )
+        if baudrate not in SUPPORTED_BAUDS:
+            raise LumagenFirmwareError(f"unsupported firmware baudrate: {baudrate}")
 
         self._progress = progress
         self._overall = 0.0
+        self._run_failed = True
         try:
             self._emit(UpdateProgress(phase=UpdatePhase.PREFLIGHT, message="checking device state"))
-            await self.preflight()
+            await self._check_expected_device(expected_model_number, expected_serial)
+            identity = await self.preflight()
 
             self._emit(
                 UpdateProgress(phase=UpdatePhase.PLANNING, message="reading current firmware")
@@ -1709,12 +1978,35 @@ class FirmwareSession:
                 # the user (and the log) what was replaced, and read_status is
                 # read-only.
                 status = await self.read_status()
+                if status.identity != identity:
+                    raise LumagenFirmwareAbortError("device identity changed during preflight")
                 plan = plan_update(bundle, status, force=force, only=only)
+            else:
+                if plan.device.identity is not None and plan.device.identity != identity:
+                    raise LumagenFirmwareAbortError(
+                        "pre-built plan belongs to a different device identity"
+                    )
+                names = tuple(section.name for section in plan.to_write)
+                if len(names) != len(set(names)):
+                    raise LumagenFirmwareImageError("pre-built plan contains duplicate writes")
+                if names:
+                    images = {}
+                    for section in plan.to_write:
+                        if section.image is None:
+                            raise LumagenFirmwareImageError("pre-built write has no firmware image")
+                        images[section.name] = section.image
+                    plan_update(
+                        FirmwareBundle(images=images),
+                        DeviceStatus(identity=identity),
+                        force=True,
+                        only=names,
+                    )
             _LOGGER.info("Firmware update plan:\n%s", plan.describe())
 
             if dry_run or plan.is_empty:
                 reason = "dry run" if dry_run else "already up to date"
                 self._emit(UpdateProgress(phase=UpdatePhase.DONE, message=reason, overall=1.0))
+                self._run_failed = False
                 return UpdateResult(
                     plan=plan,
                     dry_run=dry_run,
@@ -1757,6 +2049,7 @@ class FirmwareSession:
             self._emit(
                 UpdateProgress(phase=UpdatePhase.DONE, message="update complete", overall=1.0)
             )
+            self._run_failed = False
             return UpdateResult(
                 plan=plan,
                 written=tuple(written),
@@ -1767,6 +2060,20 @@ class FirmwareSession:
                 flush_retries=self._stats.flush_retries,
                 notes=tuple(self._stats.notes),
             )
+        except LumagenFirmwareAbortError as err:
+            if self.requires_restart:
+                raise LumagenFirmwareError(
+                    f"{err} An earlier live write may already have committed. "
+                    "Do NOT power-cycle — retry the update first."
+                ) from err
+            raise
+        except Exception as err:
+            if self.requires_restart and not isinstance(err, LumagenFirmwareError):
+                raise LumagenFirmwareError(
+                    f"the update failed after an attempted live write: {err}. "
+                    "Do NOT power-cycle — retry the update first."
+                ) from err
+            raise
         finally:
             self._overall = None
             self._overall_plan = None

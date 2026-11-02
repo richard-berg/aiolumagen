@@ -53,6 +53,7 @@ from __future__ import annotations
 import datetime
 import io
 import re
+import struct
 import zipfile
 import zlib
 from collections.abc import Iterable
@@ -340,10 +341,38 @@ def extract_updater_zip(data: bytes) -> tuple[str, bytes]:
         ``radiance_pro*.exe`` members; an encrypted, oversized or corrupt one.
         No device was contacted.
     """
-    stream = io.BytesIO(data)
-    if not zipfile.is_zipfile(stream):
-        raise LumagenFirmwareImageError("downloaded release is not a zip archive")
+    if len(data) > MAX_UPDATER_EXE_BYTES + 1024 * 1024:
+        raise LumagenFirmwareImageError("release zip exceeds the compressed input limit")
     try:
+        # Bound central-directory work before ZipFile allocates a ZipInfo for
+        # every member. The EOCD count alone is untrusted metadata.
+        end = data.rfind(b"PK\x05\x06", max(0, len(data) - 65557))
+        if end < 0 or end + 22 > len(data):
+            raise LumagenFirmwareImageError("downloaded release is not a zip archive")
+        _, disk, directory_disk, disk_count, count, size, offset, comment = struct.unpack_from(
+            "<4s4H2IH", data, end
+        )
+        if disk or directory_disk or disk_count != count or end + 22 + comment != len(data):
+            raise LumagenFirmwareImageError("unsupported multipart or malformed release zip")
+        if count > MAX_ZIP_ENTRIES:
+            raise LumagenFirmwareImageError(
+                f"release zip has {count} entries; at most {MAX_ZIP_ENTRIES} expected"
+            )
+        if offset + size != end:
+            raise LumagenFirmwareImageError("release zip has an invalid central-directory offset")
+        cursor = offset
+        seen = 0
+        while cursor < end:
+            if cursor + 46 > end or data[cursor : cursor + 4] != b"PK\x01\x02":
+                raise LumagenFirmwareImageError("release zip has a corrupt central directory")
+            seen += 1
+            if seen > MAX_ZIP_ENTRIES:
+                raise LumagenFirmwareImageError("release zip contains too many directory entries")
+            name_len, extra_len, comment_len = struct.unpack_from("<3H", data, cursor + 28)
+            cursor += 46 + name_len + extra_len + comment_len
+        if cursor != end or seen != count:
+            raise LumagenFirmwareImageError("release zip directory length/count does not match")
+        stream = io.BytesIO(data)
         with zipfile.ZipFile(stream) as archive:
             infos = archive.infolist()
             if len(infos) > MAX_ZIP_ENTRIES:
@@ -379,16 +408,15 @@ def extract_updater_zip(data: bytes) -> tuple[str, bytes]:
                 exe = member.read(limit + 1)
             if len(exe) > limit:
                 raise LumagenFirmwareImageError(f"{info.filename} decompresses past {limit} bytes")
-    # UnicodeDecodeError, not ValueError: a member flagged UTF-8 (bit 11) whose
-    # name bytes aren't UTF-8 raises it from ZipFile() or open(). ValueError
-    # would also re-wrap this function's own LumagenFirmwareImageErrors.
+    except LumagenFirmwareImageError:
+        raise
     except (
         zipfile.BadZipFile,
         zlib.error,
         EOFError,
         NotImplementedError,
         OSError,
-        UnicodeDecodeError,
+        ValueError,
     ) as err:
         raise LumagenFirmwareImageError(f"release zip is corrupt: {err}") from err
 
