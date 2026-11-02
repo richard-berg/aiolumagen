@@ -107,6 +107,12 @@ class LumagenClient:
         client marks itself unavailable and forces a transport reconnect.
         Must be greater than the longest poll interval — see the
         constructor's ValueError below for details.
+    :param outage_announced: Start as though an outage had already been
+        announced: a failed startup handshake and the first failed reconnect
+        log at debug rather than warning, until the device first answers.
+        For a consumer that replaces the client during an outage it has
+        already reported — Home Assistant builds a new client for every setup
+        retry — so that each replacement doesn't report it again.
     """
 
     # Delay (seconds, after a control command) at which we re-poll the
@@ -172,6 +178,7 @@ class LumagenClient:
         power_poll_interval: float | None = 60.0,
         status_poll_interval: float | None = 60.0,
         stale_timeout: float = 90.0,
+        outage_announced: bool = False,
     ) -> None:
         # Invariant: stale_timeout MUST be greater than the poll interval.
         # The poll loop checks staleness immediately after sending a query,
@@ -220,8 +227,10 @@ class LumagenClient:
         self._next_reconnect_at = 0.0
         self._reconnect_failures = 0
         # Set while an announced outage is in progress, so the handshakes of
-        # its reconnect attempts don't each log another warning.
-        self._link_lost = False
+        # its reconnect attempts don't each log another warning; and once its
+        # first failed reconnect has been reported, so later ones don't either.
+        self._link_lost = outage_announced
+        self._reconnect_failure_reported = outage_announced
         # Link-down handling started by the transport reporting a lost
         # connection, rather than by a poll tick; and whether either is
         # running, since the two must not interleave.
@@ -1199,7 +1208,8 @@ class LumagenClient:
 
         An outage is announced once ("now unavailable") and its first failed
         reconnect once; a handshake per later attempt would add a warning each
-        time, up to a dozen an hour for an outage that lasts.
+        time, up to a dozen an hour for an outage that lasts. A client built
+        with ``outage_announced`` starts inside such an outage.
         """
         (_LOGGER.debug if self._link_lost else _LOGGER.warning)(message, *args)
 
@@ -1438,7 +1448,8 @@ class LumagenClient:
         self._reconnect_failures += 1
         # One warning per outage; the rest at debug so a long outage doesn't
         # flood the log. Recovery is announced by _on_bytes_received.
-        log = _LOGGER.warning if self._reconnect_failures == 1 else _LOGGER.debug
+        log = _LOGGER.debug if self._reconnect_failure_reported else _LOGGER.warning
+        self._reconnect_failure_reported = True
         log(
             "Lumagen reconnect failed (attempt %d): %s; will keep retrying, next in %.0fs",
             self._reconnect_failures,
@@ -1460,6 +1471,7 @@ class LumagenClient:
         if recovered:
             self._available = True
             self._link_lost = False
+            self._reconnect_failure_reported = False
             if self._reconnect_failures:
                 _LOGGER.info(
                     "Lumagen is now available again after %d failed reconnect attempt(s)",

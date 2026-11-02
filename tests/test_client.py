@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable
 
 import pytest
@@ -1730,3 +1731,61 @@ async def test_reconnect_attempts_dont_each_log_a_warning(
     assert len(warnings) == 2, warnings
     assert warnings[0].startswith("Lumagen is now unavailable")
     assert "reconnect failed (attempt 1)" in warnings[1]
+
+
+@pytest.mark.parametrize("failure", ["closed", "silent"])
+async def test_a_client_started_inside_an_announced_outage_does_not_warn_again(
+    fake_transport: FakeTransport, caplog: pytest.LogCaptureFixture, failure: str
+) -> None:
+    """Regression: every setup retry during an outage logged another warning.
+
+    Home Assistant builds a new client for each retry, and a new client knew
+    nothing of the outage, so its failed handshake warned every time: seven
+    warnings in a three-minute outage on hardware, about 45 an hour at HA's
+    retry backoff. ``outage_announced`` lets the caller say it was reported.
+    """
+    if failure == "closed":
+        # A bridge that accepts the connection and drops it straight away.
+        fake_transport.connect_hook = fake_transport.drop
+    else:
+        fake_transport.silent = True
+    c = _FastReconnectClient(
+        fake_transport,
+        power_poll_interval=0.05,
+        status_poll_interval=None,
+        stale_timeout=0.3,
+        outage_announced=True,
+    )
+    caplog.set_level(logging.DEBUG, logger="aiolumagen.client")
+    await c.start()
+    await _wait_until(lambda: c._reconnect_failures >= 2, timeout=20.0)
+    assert [r for r in caplog.records if r.levelname == "WARNING"] == []
+    # Demoted, not dropped: the detail is still there for a debug log.
+    debug = [r.getMessage() for r in caplog.records if r.levelname == "DEBUG"]
+    assert any(m.startswith("Lumagen startup") for m in debug), debug
+    assert any("reconnect failed (attempt 1)" in m for m in debug), debug
+
+    # The device coming back ends the inherited outage; the next is reported.
+    fake_transport.connect_hook = None
+    fake_transport.silent = False
+    await _wait_until(lambda: c.available, timeout=10.0)
+    assert "Lumagen is now available" in caplog.text
+    fake_transport.silent = True
+    await _wait_until(lambda: c._reconnect_failures >= 2, timeout=20.0)
+    await c.stop()
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 2, warnings
+    assert warnings[0].startswith("Lumagen is now unavailable")
+    assert "reconnect failed (attempt 1)" in warnings[1]
+
+
+async def test_a_first_start_that_fails_still_warns(
+    fake_transport: FakeTransport, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Without ``outage_announced``, a failed handshake is the user's one clue."""
+    fake_transport.connect_hook = fake_transport.drop
+    c = LumagenClient(fake_transport, power_poll_interval=None, status_poll_interval=None)
+    await c.start()
+    await c.stop()
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert warnings == ["Lumagen startup queries aborted - transport disconnected"]
