@@ -74,6 +74,7 @@ the fallback for firmware without index 26.
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import replace
@@ -149,6 +150,49 @@ _I25_POWER_STATE = 24  # 0=off, 1=on
 _I25_SUBTITLE_SHIFT = 25  # 0=off, 1=3%, 2=6%
 _I25_AUTO_ASPECT = 26  # 0=off, 1=disabled, 2=on
 
+# The shape of each documented !I24/!I25 field: one character per letter of its
+# Tip0011 name (Tip0011_RS232CommandInterface_111023.pdf, ZQI24), so RRR is three
+# digits and WWWW four hex digits. Mode letters (Y, G, H) are just one
+# character; their vocabulary is checked where they're read. Indices 23/24 postdate Tip0011
+# but are fixed by every v5 capture. A field that doesn't fit its shape means
+# the line was damaged, so none of it is applied — see _malformed_status_field.
+_STATUS_FIELD_SHAPES: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(shape)
+    for shape in (
+        r"\d",  # 0 M
+        r"\d{3}",  # 1 RRR
+        r"\d{4}",  # 2 VVVV
+        r"\d",  # 3 D
+        r"\d",  # 4 X
+        r"\d{3}",  # 5 AAA
+        r"\d{3}",  # 6 SSS
+        r".",  # 7 Y
+        r"\d",  # 8 T
+        r"[0-9A-Fa-f]{4}",  # 9 WWWW
+        r"\d",  # 10 C
+        r"\d",  # 11 B
+        r"\d{3}",  # 12 PPP
+        r"\d{4}",  # 13 QQQQ
+        r"\d{3}",  # 14 ZZZ
+        r"\d",  # 15 E
+        r"\d",  # 16 F
+        r".",  # 17 G
+        r".",  # 18 H
+        r"\d{2}",  # 19 II
+        r"\d{2}",  # 20 KK
+        r"\d{3}",  # 21 JJJ
+        r"\d{3}",  # 22 LLL
+        r"[A-Z]?",  # 23 input memory (empty means not reported)
+        r"\d",  # 24 power
+    )
+)
+_I24_FIELD_COUNT = _I24_DETECTED_CONTENT_ASPECT + 1
+
+_3D_MODES = frozenset({"0", "1", "2", "4", "8"})
+_INPUT_MEMORIES = frozenset({"A", "B", "C", "D"})
+_MAX_INPUT = 19
+_MAX_CMS_OR_STYLE = 7
+
 _INPUT_STATUS_MAP = {
     "0": InputStatus.NO_SOURCE,
     "1": InputStatus.ACTIVE,
@@ -190,6 +234,26 @@ def _as_int(value: str, label: str) -> int | None:
     except ValueError:
         _LOGGER.debug("Could not parse %s field %r", label, value)
         return None
+
+
+def _malformed_status_field(code: str, fields: list[str]) -> int | None:
+    """Index of the first ``!I24``/``!I25`` field that can't be what it holds.
+
+    Fields past the documented layout — the empirical v5 indices 25/26, and
+    anything newer firmware appends — aren't shape-checked, so a line with
+    extra trailing fields still parses. A short line is checked as far as it
+    goes; a field cut off mid-way fails its width.
+    """
+    shapes = _STATUS_FIELD_SHAPES[:_I24_FIELD_COUNT] if code == "I24" else _STATUS_FIELD_SHAPES
+    for index, (value, shape) in enumerate(zip(fields, shapes, strict=False)):
+        if shape.fullmatch(value) is None:
+            return index
+    return None
+
+
+def _in_range(value: str, low: int, high: int) -> bool:
+    """Whether an already shape-checked digit field lies in ``low..high``."""
+    return value.isdigit() and low <= int(value) <= high
 
 
 # Type alias for the per-update callback handed to LumagenProtocol.
@@ -399,12 +463,21 @@ class LumagenProtocol:
                 pending.input_labels = {**self._state.input_labels, n: data}
         elif code == "I00":
             self._handle_i00(data, pending)
-        elif code == "I24":
-            pending.full_status_raw = data
-            self._apply_i24(data, pending)
-        elif code == "I25":
-            pending.full_status_raw = data
-            self._apply_i25(data, pending)
+        elif code in ("I24", "I25"):
+            # Rejected whole rather than field by field: a field that can't be
+            # what it holds is evidence of damage to the line — a lost comma
+            # shifts every later field into a slot it may well fit — and a
+            # partly applied line leaves state no single report described.
+            bad = _malformed_status_field(code, data.split(","))
+            if bad is not None:
+                _LOGGER.debug("Ignoring !%s with malformed field %d: %r", code, bad, data)
+                applied = False
+            elif code == "I24":
+                pending.full_status_raw = data
+                self._apply_i24(data, pending)
+            else:
+                pending.full_status_raw = data
+                self._apply_i25(data, pending)
         elif code in ("I21", "I22", "I23"):
             pending.full_status_raw = data
             self._apply_i2x(data, pending)
@@ -597,7 +670,7 @@ class LumagenProtocol:
             cs = _COLORSPACE_MAP.get(fields[_I24_COLORSPACE])
             if cs is not None:
                 state.colorspace = cs
-        if len(fields) > _I24_HDR_FLAG:
+        if len(fields) > _I24_HDR_FLAG and fields[_I24_HDR_FLAG] in ("0", "1"):
             is_hdr = fields[_I24_HDR_FLAG] == "1"
             state.is_hdr = is_hdr
             state.hdr_status = HdrStatus.HDR if is_hdr else HdrStatus.SDR
@@ -607,7 +680,9 @@ class LumagenProtocol:
                 state.source_mode = SourceMode(raw)
             except ValueError:
                 _LOGGER.debug("Unknown source mode %r", raw)
-        if len(fields) > _I24_VIRTUAL_INPUT:
+        if len(fields) > _I24_VIRTUAL_INPUT and _in_range(
+            fields[_I24_VIRTUAL_INPUT], 1, _MAX_INPUT
+        ):
             state.current_input = fields[_I24_VIRTUAL_INPUT]
 
         LumagenProtocol._apply_i24_extended(fields, state)
@@ -625,11 +700,12 @@ class LumagenProtocol:
         everything from index 8 on is shifted by two. Rather than guess, the
         shorter formats stay on :meth:`_apply_i2x_common`'s minimal set.
 
-        Every read is length-guarded and every conversion failure is
-        swallowed to a debug line: a truncated or malformed status line must
-        degrade to "field unknown", never abort the rest of the parse.
+        Every read is length-guarded, and a value outside a field's known
+        vocabulary leaves the prior value in place: the line's shape was
+        already checked, so this is most likely firmware with a value we don't
+        know yet, and the rest of the line is still good.
         """
-        if len(fields) > _I24_SOURCE_3D_MODE:
+        if len(fields) > _I24_SOURCE_3D_MODE and fields[_I24_SOURCE_3D_MODE] in _3D_MODES:
             state.source_3d_mode = fields[_I24_SOURCE_3D_MODE]
         if len(fields) > _I24_INPUT_CONFIG:
             state.input_config = fields[_I24_INPUT_CONFIG]
@@ -639,7 +715,7 @@ class LumagenProtocol:
             nls = fields[_I24_NLS_ACTIVE]
             if nls in ("N", "-"):
                 state.nls_active = nls == "N"
-        if len(fields) > _I24_OUTPUT_3D_MODE:
+        if len(fields) > _I24_OUTPUT_3D_MODE and fields[_I24_OUTPUT_3D_MODE] in _3D_MODES:
             state.output_3d_mode = fields[_I24_OUTPUT_3D_MODE]
         if len(fields) > _I24_OUTPUT_ENABLED:
             raw_mask = fields[_I24_OUTPUT_ENABLED].strip()
@@ -652,11 +728,11 @@ class LumagenProtocol:
                 state.active_outputs = decode_output_mask(mask)
         if len(fields) > _I24_OUTPUT_CMS:
             cms = _as_int(fields[_I24_OUTPUT_CMS], "output CMS")
-            if cms is not None:
+            if cms is not None and cms <= _MAX_CMS_OR_STYLE:
                 state.output_cms = cms
         if len(fields) > _I24_OUTPUT_STYLE:
             style = _as_int(fields[_I24_OUTPUT_STYLE], "output style")
-            if style is not None:
+            if style is not None and style <= _MAX_CMS_OR_STYLE:
                 state.output_style = style
         if len(fields) > _I24_OUTPUT_ASPECT:
             state.output_aspect = fields[_I24_OUTPUT_ASPECT]
@@ -669,7 +745,9 @@ class LumagenProtocol:
                 state.output_scan_mode = SourceMode(raw_mode)
             except ValueError:
                 _LOGGER.debug("Unknown output scan mode %r", raw_mode)
-        if len(fields) > _I24_PHYSICAL_INPUT:
+        if len(fields) > _I24_PHYSICAL_INPUT and _in_range(
+            fields[_I24_PHYSICAL_INPUT], 1, _MAX_INPUT
+        ):
             state.physical_input = fields[_I24_PHYSICAL_INPUT]
         if len(fields) > _I24_DETECTED_SOURCE_ASPECT:
             state.detected_source_aspect = fields[_I24_DETECTED_SOURCE_ASPECT]
@@ -761,9 +839,9 @@ class LumagenProtocol:
         fields = data.split(",")
         if len(fields) > _I25_INPUT_MEMORY:
             mem = fields[_I25_INPUT_MEMORY]
-            if mem:  # Treat empty string the same as "not reported"
+            if mem in _INPUT_MEMORIES:  # empty means "not reported"
                 state.input_memory = mem
-        if len(fields) > _I25_POWER_STATE:
+        if len(fields) > _I25_POWER_STATE and fields[_I25_POWER_STATE] in ("0", "1"):
             state.power_on = fields[_I25_POWER_STATE] == "1"
         # Indices 25/26 are empirical (see the module docstring). A firmware
         # that stops at power leaves both unset rather than guessing.

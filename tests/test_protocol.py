@@ -10,7 +10,15 @@ from __future__ import annotations
 import pytest
 
 from aiolumagen.protocol import LumagenProtocol
-from aiolumagen.state import Colorspace, HdrStatus, InputStatus, LumagenState, SourceMode
+from aiolumagen.state import (
+    AutoAspectStatus,
+    Colorspace,
+    HdrStatus,
+    InputStatus,
+    LumagenState,
+    SourceMode,
+    SubtitleShift,
+)
 
 
 def _collect() -> tuple[list[tuple[LumagenState, tuple[str, ...]]], LumagenProtocol]:
@@ -950,3 +958,195 @@ def test_o01_does_not_touch_rate_fields() -> None:
     after = updates[-1][0]
     assert after.output_vrate == before.output_vrate
     assert after.output_refresh_hz == before.output_refresh_hz
+
+
+# ---------- Status-line validation ----------
+#
+# Regression: !I24/!I25 fields were accepted one by one with no check that
+# they could be what the field holds. The fault proxy's
+# "!I25,zz,yy,xx,ww,..." set source_resolution to "xx" and source_vrate to
+# "yy", and Home Assistant showed them.
+
+# Firmware 030326: the v4 layout, memory and power, then subtitle shift and
+# auto aspect. Every field but power differs from the baseline below, so a
+# field that was applied (or kept) is visible. Power is on in both, because the
+# old parser read any unknown power value as off.
+_V5_LINE = "1,059,2160,0,0,178,178,-,0,000e,0,0,059,2160,237,2,0,p,P,01,01,178,178,A,1,0,2"
+_V5_FIELDS = tuple(_V5_LINE.split(","))
+_BASELINE = "0,023,1080,2,3,133,240,N,4,0003,5,6,050,1080,178,1,1,i,I,07,08,185,235,C,1,1,0"
+
+
+def _baseline_protocol() -> tuple[list[tuple[LumagenState, tuple[str, ...]]], LumagenProtocol]:
+    updates, proto = _collect()
+    proto.feed_bytes(f"!I25,{_BASELINE}\r\n".encode())
+    assert updates[-1][0].full_status_raw == _BASELINE
+    return updates, proto
+
+
+def _line(fields: list[str] | tuple[str, ...]) -> bytes:
+    return ("!I25," + ",".join(fields) + "\r\n").encode()
+
+
+def _with(index: int, value: str) -> list[str]:
+    fields = list(_V5_FIELDS)
+    fields[index] = value
+    return fields
+
+
+def test_the_fault_proxys_garbage_status_line_changes_nothing() -> None:
+    updates, proto = _baseline_protocol()
+    before = proto.state
+    seen: list[tuple[str, str]] = []
+    proto.add_response_observer(lambda code, payload: seen.append((code, payload)))
+    proto.feed_bytes(b"!I25,zz,yy,xx,ww,vv,uu,tt,ss,rr,qq,pp,oo,nn,mm\r\n")
+    assert proto.state == before
+    assert proto.state.source_resolution == "1080"
+    assert proto.state.source_vrate == "023"
+    assert len(updates) == 1
+    # Still delivered to a waiter: the line arrived, it just isn't believed.
+    assert seen == [("I25", "zz,yy,xx,ww,vv,uu,tt,ss,rr,qq,pp,oo,nn,mm")]
+
+
+# (index, value of the wrong shape) for every documented field kind.
+_MALFORMED = [
+    pytest.param(0, "x", id="M-not-a-digit"),
+    pytest.param(1, "yy", id="RRR-not-digits"),
+    pytest.param(1, "59", id="RRR-too-short"),
+    pytest.param(2, "xx", id="VVVV-not-digits"),
+    pytest.param(2, "21600", id="VVVV-too-long"),
+    pytest.param(3, "a", id="D-not-a-digit"),
+    pytest.param(4, "!", id="X-not-a-digit"),
+    pytest.param(5, "1.78", id="AAA-not-digits"),
+    pytest.param(6, "", id="SSS-empty"),
+    pytest.param(7, "--", id="Y-two-characters"),
+    pytest.param(8, "T", id="T-not-a-digit"),
+    pytest.param(9, "zzzz", id="WWWW-not-hex"),
+    pytest.param(9, "00e", id="WWWW-too-short"),
+    pytest.param(10, "?", id="C-not-a-digit"),
+    pytest.param(11, "10", id="B-two-digits"),
+    pytest.param(12, "o59", id="PPP-not-digits"),
+    pytest.param(13, "216", id="QQQQ-too-short"),
+    pytest.param(14, "2.37", id="ZZZ-not-digits"),
+    pytest.param(15, "E", id="E-not-a-digit"),
+    pytest.param(16, "yes", id="F-not-a-digit"),
+    pytest.param(17, "", id="G-empty"),
+    pytest.param(18, "PP", id="H-two-characters"),
+    pytest.param(19, "1", id="II-too-short"),
+    pytest.param(20, "o1", id="KK-not-digits"),
+    pytest.param(21, "17B", id="JJJ-not-digits"),
+    pytest.param(22, "1780", id="LLL-too-long"),
+    pytest.param(23, "AB", id="memory-two-letters"),
+    pytest.param(24, "on", id="power-not-a-digit"),
+]
+
+
+@pytest.mark.parametrize(("index", "value"), _MALFORMED)
+def test_a_field_of_the_wrong_shape_rejects_the_whole_line(index: int, value: str) -> None:
+    """Nothing from a damaged line is applied, not even its good-looking fields.
+
+    A lost comma shifts every later field into a slot it may well fit, so a
+    field that can't be right is reason to distrust the rest of the line.
+    """
+    updates, proto = _baseline_protocol()
+    before = proto.state
+    proto.feed_bytes(_line(_with(index, value)))
+    assert proto.state == before
+    assert len(updates) == 1
+
+
+def test_a_line_cut_off_mid_field_is_rejected() -> None:
+    _updates, proto = _baseline_protocol()
+    before = proto.state
+    proto.feed_bytes(b"!I25,1,059,21\r\n")
+    assert proto.state == before
+
+
+def test_a_line_cut_off_at_a_comma_applies_what_it_has() -> None:
+    _updates, proto = _baseline_protocol()
+    proto.feed_bytes(_line(_V5_FIELDS[:3]))
+    assert proto.state.input_status is InputStatus.ACTIVE
+    assert proto.state.source_resolution == "2160"
+    assert proto.state.colorspace is Colorspace.REC_709  # baseline, not reached
+
+
+# (index, value of the right shape but outside the field's vocabulary,
+#  attribute, the baseline value it must keep)
+_OUT_OF_RANGE = [
+    pytest.param(0, "7", "input_status", InputStatus.NO_SOURCE, id="M"),
+    pytest.param(3, "3", "source_3d_mode", "2", id="D"),
+    pytest.param(7, "Q", "nls_active", True, id="Y"),
+    pytest.param(8, "5", "output_3d_mode", "4", id="T"),
+    pytest.param(10, "8", "output_cms", 5, id="C"),
+    pytest.param(11, "9", "output_style", 6, id="B"),
+    pytest.param(15, "7", "colorspace", Colorspace.REC_709, id="E"),
+    pytest.param(16, "2", "hdr_status", HdrStatus.HDR, id="F"),
+    pytest.param(17, "x", "source_mode", SourceMode.INTERLACED, id="G"),
+    pytest.param(18, "X", "output_scan_mode", SourceMode.INTERLACED, id="H"),
+    pytest.param(19, "00", "current_input", "07", id="II-zero"),
+    pytest.param(19, "20", "current_input", "07", id="II-above-19"),
+    pytest.param(20, "99", "physical_input", "08", id="KK"),
+    pytest.param(23, "E", "input_memory", "C", id="memory"),
+    pytest.param(24, "7", "power_on", True, id="power"),
+    pytest.param(25, "9", "subtitle_shift", SubtitleShift.PERCENT_3, id="subtitle-shift"),
+    pytest.param(26, "x", "auto_aspect_status", AutoAspectStatus.OFF, id="auto-aspect"),
+]
+
+
+@pytest.mark.parametrize(("index", "value", "attribute", "kept"), _OUT_OF_RANGE)
+def test_an_unknown_value_keeps_that_field_and_applies_the_rest(
+    index: int, value: str, attribute: str, kept: object
+) -> None:
+    """In shape but outside the known vocabulary: most likely newer firmware.
+
+    Rejecting the line for it would freeze every signal sensor on a firmware
+    that added one value, so only that field keeps its prior value.
+    """
+    _updates, proto = _baseline_protocol()
+    proto.feed_bytes(_line(_with(index, value)))
+    assert getattr(proto.state, attribute) == kept
+    # The rest of the line landed.
+    assert proto.state.source_resolution == "2160"
+    assert proto.state.full_status_raw == ",".join(_with(index, value))
+
+
+def test_a_valid_line_with_extra_trailing_fields_parses_fully() -> None:
+    """Newer firmware appending fields must not cost any that we know."""
+    _updates, proto = _baseline_protocol()
+    proto.feed_bytes(_line([*_V5_FIELDS, "9", "ABC", "x.y"]))
+    state = proto.state
+    assert state.input_status is InputStatus.ACTIVE
+    assert state.source_vrate == "059"
+    assert state.source_resolution == "2160"
+    assert state.source_3d_mode == "0"
+    assert state.input_config == "0"
+    assert state.source_aspect == "178"
+    assert state.content_aspect == "178"
+    assert state.nls_active is False
+    assert state.output_3d_mode == "0"
+    assert state.active_outputs == (2, 3, 4)
+    assert state.output_cms == 0
+    assert state.output_style == 0
+    assert state.output_vrate == "059"
+    assert state.output_resolution == "2160"
+    assert state.output_aspect == "237"
+    assert state.colorspace is Colorspace.REC_2020
+    assert state.hdr_status is HdrStatus.SDR
+    assert state.source_mode is SourceMode.PROGRESSIVE
+    assert state.output_scan_mode is SourceMode.PROGRESSIVE
+    assert state.current_input == "01"
+    assert state.physical_input == "01"
+    assert state.detected_source_aspect == "178"
+    assert state.detected_content_aspect == "178"
+    assert state.input_memory == "A"
+    assert state.power_on is True
+    assert state.subtitle_shift is SubtitleShift.OFF
+    assert state.auto_aspect_status is AutoAspectStatus.ON
+
+
+def test_i24_lines_are_validated_too() -> None:
+    _updates, proto = _collect()
+    proto.feed_bytes(b"!I24," + ",".join(_V5_FIELDS[:23]).encode() + b"\r\n")
+    before = proto.state
+    assert before.source_resolution == "2160"
+    proto.feed_bytes(b"!I24,1,059,xxxx," + ",".join(_V5_FIELDS[3:23]).encode() + b"\r\n")
+    assert proto.state == before
