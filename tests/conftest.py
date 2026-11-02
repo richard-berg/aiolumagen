@@ -46,6 +46,7 @@ class FakeTransport:
 
     def __init__(self) -> None:
         self._on_data: Callable[[bytes], None] | None = None
+        self._on_connection_lost: Callable[[], None] | None = None
         self.sent: list[bytes] = []
         self._connected = False
         self.connect_hook: Callable[[], Any] | None = None
@@ -66,6 +67,9 @@ class FakeTransport:
     def set_data_callback(self, callback: Callable[[bytes], None]) -> None:
         self._on_data = callback
 
+    def set_connection_lost_callback(self, callback: Callable[[], None]) -> None:
+        self._on_connection_lost = callback
+
     async def connect(self) -> None:
         self.connect_calls += 1
         if self.fail_connects > 0:
@@ -83,6 +87,8 @@ class FakeTransport:
     def drop(self) -> None:
         """Simulate the peer closing the connection (``connection_lost``)."""
         self._connected = False
+        if self._on_connection_lost is not None:
+            self._on_connection_lost()
 
     async def write(self, data: bytes) -> None:
         if not self._connected:

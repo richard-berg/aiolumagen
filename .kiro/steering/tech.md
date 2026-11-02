@@ -132,7 +132,7 @@ uv run python examples/via_url.py 'esphome://10.0.0.42:6053/?port_name=Lumagen&k
 
 | Library exception | HA mapping (in the integration) |
 |---|---|
-| `LumagenConnectionError` | `ConfigEntryNotReady`, or device unavailable from the coordinator |
+| `LumagenConnectionError` | `ConfigEntryNotReady`, or device unavailable from the coordinator; from a command, a translated `HomeAssistantError` (`not_connected`) |
 | `LumagenCommandError` | Log a warning; don't surface to the user. Also subclasses `ValueError` |
 | `LumagenFirmwareImageError` | Bad input file; no device was contacted. Also subclasses `ValueError` |
 | `LumagenFirmwareAbortError` | Update refused or stopped **before touching live firmware**. Tell the user nothing changed and offer a retry |

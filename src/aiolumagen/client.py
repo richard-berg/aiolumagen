@@ -75,6 +75,8 @@ class _TransportLike(Protocol):
 
     def set_data_callback(self, callback: Callable[[bytes], None]) -> None: ...
 
+    def set_connection_lost_callback(self, callback: Callable[[], None]) -> None: ...
+
     async def connect(self) -> None: ...
 
     async def disconnect(self) -> None: ...
@@ -220,6 +222,11 @@ class LumagenClient:
         # Set while an announced outage is in progress, so the handshakes of
         # its reconnect attempts don't each log another warning.
         self._link_lost = False
+        # Link-down handling started by the transport reporting a lost
+        # connection, rather than by a poll tick; and whether either is
+        # running, since the two must not interleave.
+        self._link_down_task: asyncio.Task[None] | None = None
+        self._handling_link_down = False
         # Response-code -> futures awaiting that code. Populated by
         # _register_waiter and drained by _on_response; see the
         # "Request/response correlation" section below.
@@ -243,6 +250,7 @@ class LumagenClient:
         # can't rely on state-update callbacks alone — a steady-state
         # Lumagen would look unresponsive even while polls succeed.
         self._transport.set_data_callback(self._on_bytes_received)
+        self._transport.set_connection_lost_callback(self._on_transport_lost)
         await self._transport.connect()
         self._connected_at = asyncio.get_running_loop().time()
         self._started = True
@@ -265,6 +273,11 @@ class LumagenClient:
             with suppress(asyncio.CancelledError):
                 await self._refresh_task
             self._refresh_task = None
+        if self._link_down_task is not None:
+            self._link_down_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._link_down_task
+            self._link_down_task = None
         await self._cancel_recovery()
         self._fail_waiters("Client stopped while awaiting a response")
         await self._transport.disconnect()
@@ -1278,6 +1291,9 @@ class LumagenClient:
              :attr:`RECONNECT_BACKOFF_INITIAL` / :attr:`RECONNECT_BACKOFF_MAX`).
              A reconnect counts as successful only when bytes come back.
 
+        A transport that reports its connection lost doesn't wait for a tick:
+        :meth:`_on_transport_lost` starts the same handling at once.
+
         Step 2 is level-triggered on purpose. It used to run only on the
         available -> unavailable edge, so a single failed attempt — e.g. the
         ESP bridge still rebooting when the retry fired — ended recovery for
@@ -1344,8 +1360,45 @@ class LumagenClient:
             return f"no response in {self._stale_timeout:.0f}s"
         return None
 
+    def _on_transport_lost(self) -> None:
+        """React to the transport losing its connection, without waiting for a tick.
+
+        The poll loop would find out at its next tick, up to a poll interval
+        later. Until then the client already reports unavailable (``available``
+        checks the transport) but listeners haven't been told, so a consumer
+        rendering on their calls keeps showing the link up, and commands sent
+        in that window fail against a transport nobody is reopening. Observed
+        on hardware as up to 15 s of exactly that after the bridge closed the
+        connection.
+
+        Only once the poll loop is running: it owns link supervision, and
+        during :meth:`start`'s handshake a drop is the first tick's to handle.
+        """
+        if not self._started or self._poll_task is None:
+            return
+        if self._link_down_task is not None and not self._link_down_task.done():
+            return
+        self._link_down_task = asyncio.create_task(
+            self._handle_link_down("transport disconnected"), name="aiolumagen-link-down"
+        )
+
     async def _handle_link_down(self, reason: str) -> None:
-        """Announce the outage once, then attempt a reconnect if backoff allows."""
+        """Announce the outage once, then attempt a reconnect if backoff allows.
+
+        Reached both from a poll tick and from :meth:`_on_transport_lost`; a
+        call while another is still running returns at once, since that one is
+        already announcing and reconnecting. Two at a time would each tear
+        down the transport the other just opened.
+        """
+        if self._handling_link_down:
+            return
+        self._handling_link_down = True
+        try:
+            await self._handle_link_down_once(reason)
+        finally:
+            self._handling_link_down = False
+
+    async def _handle_link_down_once(self, reason: str) -> None:
         if self._available:
             self._available = False
             self._link_lost = True

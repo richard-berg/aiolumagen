@@ -475,6 +475,120 @@ async def test_link_supervision_does_not_reconnect_a_healthy_link(
     assert fake_transport.connect_calls == 1
 
 
+async def test_a_dropped_connection_is_handled_without_waiting_for_a_poll_tick(
+    fake_transport: FakeTransport, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Regression: a closed connection went unnoticed until the next poll tick.
+
+    ``available`` already read False, but listeners weren't told and nothing
+    reopened the transport until the poll loop next woke — up to 15 s on
+    hardware, during which Home Assistant still showed the link up and every
+    command failed with "Transport is not connected".
+    """
+    c = _FastReconnectClient(
+        fake_transport,
+        power_poll_interval=30.0,
+        status_poll_interval=None,
+        stale_timeout=60.0,
+    )
+    events: list[tuple[str, ...]] = []
+    c.subscribe(lambda _state, codes: events.append(codes))
+    await c.start()
+    events.clear()
+
+    fake_transport.drop()
+    await _wait_until(lambda: ("_available",) in events, timeout=2.0)
+
+    assert events.count(("_unavailable",)) == 1
+    assert events.index(("_unavailable",)) < events.index(("_available",))
+    assert fake_transport.connect_calls == 2
+    assert c.available
+    await c.send_command("ZQS02")
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert warnings[0].startswith("Lumagen is now unavailable (transport disconnected)")
+    await c.stop()
+
+
+async def test_a_dropped_connection_is_handled_once_when_a_tick_lands_mid_reconnect(
+    fake_transport: FakeTransport,
+) -> None:
+    """The drop and the poll loop both handle link-down; never at the same time.
+
+    A second handler running alongside the first would tear down the
+    transport the first had just opened, and announce or reconnect twice.
+    """
+    c = _FastReconnectClient(
+        fake_transport,
+        power_poll_interval=0.01,
+        status_poll_interval=None,
+        stale_timeout=60.0,
+    )
+    events: list[tuple[str, ...]] = []
+    c.subscribe(lambda _state, codes: events.append(codes))
+    await c.start()
+    events.clear()
+
+    async def slow_open() -> None:
+        # Still opening for many poll ticks, each of which sees it down.
+        fake_transport._connected = False
+        await asyncio.sleep(0.2)
+        fake_transport._connected = True
+
+    fake_transport.connect_hook = slow_open
+    fake_transport.drop()
+    # A second report of the same loss while the first is being handled.
+    fake_transport.drop()
+    await asyncio.sleep(0)
+    assert events == [("_unavailable",)]
+
+    await _wait_until(lambda: ("_available",) in events, timeout=2.0)
+    fake_transport.connect_hook = None
+    assert fake_transport.connect_calls == 2
+    assert events == [("_unavailable",), ("_available",)]
+    await c.stop()
+
+
+async def test_stop_cancels_link_down_handling_in_flight(fake_transport: FakeTransport) -> None:
+    """Stopping mid-reconnect leaves no task behind to reopen the transport."""
+    c = _FastReconnectClient(
+        fake_transport,
+        power_poll_interval=30.0,
+        status_poll_interval=None,
+        stale_timeout=60.0,
+    )
+    await c.start()
+    opening = asyncio.Event()
+
+    async def hang() -> None:
+        opening.set()
+        await asyncio.sleep(10)
+
+    fake_transport.connect_hook = hang
+    fake_transport.drop()
+    await asyncio.wait_for(opening.wait(), 1.0)
+    task = c._link_down_task
+    assert task is not None
+    await c.stop()
+    assert task.cancelled()
+    assert not fake_transport.connected
+
+
+async def test_drops_are_ignored_after_stop(fake_transport: FakeTransport) -> None:
+    c = _FastReconnectClient(
+        fake_transport,
+        power_poll_interval=30.0,
+        status_poll_interval=None,
+        stale_timeout=60.0,
+    )
+    await c.start()
+    await c.stop()
+    fake_transport._connected = True
+    fake_transport.drop()
+    await asyncio.sleep(0.05)
+    assert fake_transport.connect_calls == 1
+
+
 # --- Recovery re-query -----------------------------------------------------
 
 

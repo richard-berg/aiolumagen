@@ -90,10 +90,16 @@ def normalize_flush_status(status: object) -> str:
 
 
 class _BridgeProtocol(asyncio.Protocol):
-    """asyncio.Protocol that fans inbound bytes to the owning transport."""
+    """asyncio.Protocol that fans inbound bytes to the owning transport.
+
+    One instance per connection, so the owner can tell a loss of the
+    connection it currently holds from the late ``connection_lost`` of one it
+    already closed and replaced.
+    """
 
     def __init__(self, owner: LumagenTransport) -> None:
         self._owner = owner
+        self.lost = False
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         _LOGGER.debug("Serial connection established via %s", self._owner.url)
@@ -103,7 +109,8 @@ class _BridgeProtocol(asyncio.Protocol):
 
     def connection_lost(self, exc: Exception | None) -> None:
         _LOGGER.debug("Serial connection closed (%s): %s", self._owner.url, exc)
-        self._owner._handle_connection_lost()
+        self.lost = True
+        self._owner._handle_connection_lost(self)
 
 
 class LumagenTransport:
@@ -119,7 +126,9 @@ class LumagenTransport:
         self.url = url
         self.baudrate = baudrate
         self._on_data: Callable[[bytes], None] | None = None
+        self._on_connection_lost: Callable[[], None] | None = None
         self._transport: asyncio.Transport | None = None
+        self._protocol: _BridgeProtocol | None = None
         self._connected = False
 
     @property
@@ -130,23 +139,43 @@ class LumagenTransport:
         """Register the inbound-data callback. Must be set before :meth:`connect`."""
         self._on_data = callback
 
+    def set_connection_lost_callback(self, callback: Callable[[], None]) -> None:
+        """Register a callback for the connection closing underneath us.
+
+        Fires when the peer, the bridge or the OS ends the connection (a
+        closed socket, an unplugged adapter) — the moment it happens, so the
+        owner needn't discover it at its next write or poll. Not called for
+        :meth:`disconnect`, which the owner asked for.
+        """
+        self._on_connection_lost = callback
+
     async def connect(self) -> None:
         if self._connected:
             return
         loop = asyncio.get_running_loop()
+        protocol = _BridgeProtocol(self)
         try:
             transport, _protocol = await serialx.create_serial_connection(
                 loop,
-                lambda: _BridgeProtocol(self),
+                lambda: protocol,
                 url=self.url,
                 baudrate=self.baudrate,
             )
         except Exception as err:
             raise LumagenConnectionError(self._connect_error_message(err)) from err
+        if protocol.lost:
+            # Closed before we'd even taken it; nobody was told, so say it here.
+            raise LumagenConnectionError(
+                f"Could not open {self.url!r}: the connection closed as it opened"
+            )
         self._transport = transport
+        self._protocol = protocol
         self._connected = True
 
     async def disconnect(self) -> None:
+        # Forgotten before closing, so the connection_lost this causes is
+        # recognised as ours and not reported as a loss.
+        self._protocol = None
         if self._transport is not None:
             self._transport.close()
             self._transport = None
@@ -312,6 +341,13 @@ class LumagenTransport:
         if self._on_data is not None and data:
             self._on_data(data)
 
-    def _handle_connection_lost(self) -> None:
+    def _handle_connection_lost(self, protocol: _BridgeProtocol) -> None:
+        if protocol is not self._protocol:
+            # One we closed ourselves, possibly already replaced by a new
+            # connection that this must not mark as down.
+            return
+        self._protocol = None
         self._connected = False
         self._transport = None
+        if self._on_connection_lost is not None:
+            self._on_connection_lost()
