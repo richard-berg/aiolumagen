@@ -357,5 +357,28 @@ class LumagenState:
     """Whether the connected display reports Rec.2020 EDID support."""
 
     # --- Bookkeeping ---
+    valid_response_generation: int = field(default=0, compare=False, kw_only=True)
+    """Count of accepted device reports, including equal-valued replies.
+
+    Complete, validated known reports and comma-delimited empty query replies
+    in the S/I/O namespaces advance it. Damaged, incomplete and unrecognized
+    nonempty reports do not. Excluded from equality and retained on reconnect.
+    The client uses this progress, rather than raw bytes, for liveness.
+    """
+
+    sharpness_report_generation: int = field(default=0, compare=False, kw_only=True)
+    """Count of complete, valid ``!I30`` reports seen by this client.
+
+    Advances even when the reported values are unchanged. Invalid, empty or
+    partial reports and outbound setters do not advance it. The counter survives
+    reconnects, starts at zero on a new client, and is excluded from state
+    equality, so subscribers retain their usual no-op deduplication.
+
+    Compare against the generation saved before a compound sharpness write to
+    distinguish a new valid readback from stale cached state. Read the client's
+    current ``state``: a previously retained snapshot keeps its old generation.
+    This is report freshness, not an acknowledgement of a particular write.
+    """
+
     last_update_codes: tuple[str, ...] = field(default_factory=tuple)
     """Codes touched by the most recent protocol update (for debugging)."""

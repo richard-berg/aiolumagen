@@ -225,7 +225,7 @@ def input_command(n: int) -> str:
     stray digit the device treats as menu input. It was silently wrong — a
     valid command sequence for the wrong operation, so nothing rejected it.
     """
-    if not 1 <= n <= 19:
+    if not isinstance(n, int) or isinstance(n, bool) or not 1 <= n <= 19:
         raise LumagenCommandError(f"input must be 1-19, got {n}")
     if n <= 9:
         return f"i{n}"
@@ -250,7 +250,7 @@ def sharpness_command(
     horizontal and vertical sharpness to the same level. For independent
     H/V control use ``ZY522`` (not yet wrapped — call via ``send_command``).
     """
-    if not 0 <= level <= 7:
+    if not isinstance(level, int) or isinstance(level, bool) or not 0 <= level <= 7:
         raise LumagenCommandError(f"sharpness level must be 0-7, got {level}")
     try:
         sens = SharpnessSensitivity(sensitivity)
@@ -282,7 +282,7 @@ def fan_speed_command(speed: int) -> str:
 
     Requires CR terminator on send.
     """
-    if not 1 <= speed <= 10:
+    if not isinstance(speed, int) or isinstance(speed, bool) or not 1 <= speed <= 10:
         raise LumagenCommandError(f"fan speed must be 1-10, got {speed}")
     return f"ZY552{speed - 1}"
 
@@ -293,7 +293,7 @@ def subtitle_shift_command(level: int) -> str:
     Requires CR terminator on send. Reverse-engineered from the firmware;
     the bundled Tip0011 PDF doesn't document this command explicitly.
     """
-    if level not in (0, 1, 2):
+    if not isinstance(level, int) or isinstance(level, bool) or level not in (0, 1, 2):
         raise LumagenCommandError(f"subtitle shift must be 0, 1, or 2; got {level}")
     return f"ZY553{level}"
 
@@ -325,7 +325,11 @@ def hdr_intensity_mapping_command(*, display_max_nits: int, gamma_mode: HdrGamma
     :param gamma_mode: :class:`~aiolumagen.state.HdrGammaMode`. A bare
         ``"A"``/``"H"``/``"S"`` string is still accepted and coerced.
     """
-    if display_max_nits != 0 and not 50 <= display_max_nits <= 10000:
+    if (
+        not isinstance(display_max_nits, int)
+        or isinstance(display_max_nits, bool)
+        or (display_max_nits != 0 and not 50 <= display_max_nits <= 10000)
+    ):
         raise LumagenCommandError(
             f"display_max_nits must be 0 (disable) or 50-10000, got {display_max_nits}"
         )
@@ -430,7 +434,7 @@ def osd_message_command(
         sanitisation (use :func:`osd_clear_command` to clear the OSD — sending
         an empty message is not how that's done).
     """
-    if not 0 <= duration <= 9:
+    if not isinstance(duration, int) or isinstance(duration, bool) or not 0 <= duration <= 9:
         raise LumagenCommandError(f"OSD duration must be 0-9, got {duration}")
     explicit = line1 is not None or line2 is not None
     if text is not None and explicit:
@@ -532,7 +536,11 @@ def input_label_command(input_number: int, label: str, *, memory: str = "A") -> 
         render. Unlike OSD message text, an illegal label is refused rather
         than silently stripped — see :func:`sanitize_osd_text` for why.
     """
-    if not 1 <= input_number <= 8:
+    if (
+        not isinstance(input_number, int)
+        or isinstance(input_number, bool)
+        or not 1 <= input_number <= 8
+    ):
         raise LumagenCommandError(f"input-label input must be 1-8, got {input_number}")
     bank = memory.upper()
     if bank in ("ALL", _INPUT_LABEL_ALL_MEMORIES):
@@ -577,7 +585,11 @@ def input_restart_command(input_number: int | str = "all") -> str:
         if input_number.strip().upper() not in ("ALL", "A"):
             raise LumagenCommandError(f"input restart takes 1-8 or 'all', got {input_number!r}")
         return "ZY520A"
-    if not 1 <= input_number <= 8:
+    if (
+        not isinstance(input_number, int)
+        or isinstance(input_number, bool)
+        or not 1 <= input_number <= 8
+    ):
         raise LumagenCommandError(f"input restart takes 1-8 or 'all', got {input_number}")
     return f"ZY520{input_number - 1}"
 

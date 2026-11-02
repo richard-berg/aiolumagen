@@ -74,6 +74,7 @@ the fallback for firmware without index 26.
 from __future__ import annotations
 
 import logging
+import math
 import re
 from collections.abc import Callable
 from contextlib import suppress
@@ -256,6 +257,75 @@ def _in_range(value: str, low: int, high: int) -> bool:
     return value.isdigit() and low <= int(value) <= high
 
 
+def _valid_report(code: str, data: str, *, delimited: bool) -> bool:
+    """Whether a complete response is credible evidence of device liveness."""
+    if not data:
+        # A bare S00 is a heartbeat. Unsupported queries echo an empty field;
+        # a bare S02/I30/etc. can instead be a truncated response.
+        return code == "S00" or (delimited and re.fullmatch(r"[SIO][0-9A-F]{2}", code) is not None)
+    if code in ("S02", "I53", "I54"):
+        return data in ("0", "1")
+    if code == "I50":
+        return data in ("Y", "N")
+    if code == "I30":
+        compact = data.replace(",", "").replace(" ", "").strip()
+        return re.fullmatch(r"[YN][0-7][HN]", compact) is not None
+    if code in ("S1A", "S1B", "S1C", "S1D"):
+        return delimited and len(data) <= 10
+    fields = data.split(",")
+    if code == "S01":
+        return (
+            len(fields) >= 4
+            and bool(fields[0].strip())
+            and re.fullmatch(r"[0-9]{6}", fields[1].strip()) is not None
+            and all(part.strip().isdigit() for part in fields[2:4])
+        )
+    if code == "I00":
+        return (
+            len(fields) >= 3
+            and _in_range(fields[0], 1, _MAX_INPUT)
+            and fields[1] in _INPUT_MEMORIES
+            and fields[2].isdigit()
+        )
+    if code in ("I21", "I22", "I23", "I24", "I25"):
+        # Seven leading fields also cover legacy/no-source reports. Later
+        # legacy layouts are ambiguous, but these positions are stable.
+        if len(fields) < 7 or any(
+            shape.fullmatch(value) is None
+            for value, shape in zip(fields[:7], _STATUS_FIELD_SHAPES[:7], strict=True)
+        ):
+            return False
+        if code in ("I24", "I25"):
+            if _malformed_status_field(code, fields) is not None:
+                return False
+            if code == "I25" and any(
+                re.fullmatch(r"[0-9]", value) is None for value in fields[25:27]
+            ):
+                return False
+        return True
+    if code == "I52":
+        if len(fields) < 4 or fields[0] not in ("0", "1"):
+            return False
+        try:
+            minimum = float(fields[1])
+            return (
+                math.isfinite(minimum)
+                and minimum >= 0
+                and fields[2].isdigit()
+                and fields[3].isdigit()
+            )
+        except ValueError:
+            return False
+    if code == "O01":
+        return (
+            len(fields) >= 5
+            and all(part.strip().isdigit() for part in fields[:3])
+            and fields[3] in ("0", "1")
+            and fields[4] in _3D_MODES
+        )
+    return False
+
+
 # Type alias for the per-update callback handed to LumagenProtocol.
 StateUpdateCallback = Callable[[LumagenState, tuple[str, ...]], None]
 """Callback shape: ``(new_state, codes_touched) -> None``.
@@ -302,6 +372,7 @@ class LumagenProtocol:
         self._on_update = on_update
         self._state = LumagenState()
         self._rx = bytearray()
+        self._discarding_line = False
         self._response_observers: list[ResponseObserver] = []
         # Correlation context for input-label queries. The Lumagen's label
         # response (!S1x,<label>) reports only the memory letter, never the
@@ -310,6 +381,7 @@ class LumagenProtocol:
         # while a serialized query is in flight — labels are query-only, so
         # no unsolicited !S1x can race it.
         self._pending_label_input: int | None = None
+        self._pending_label_memory: str | None = None
 
     @property
     def state(self) -> LumagenState:
@@ -332,15 +404,17 @@ class LumagenProtocol:
         """
         return self._pending_label_input
 
-    def expect_input_label(self, input_number: int | None) -> None:
+    def expect_input_label(self, input_number: int | None, *, memory: str | None = None) -> None:
         """Prime the parser to attribute the next ``!S1x`` response to ``input_number``.
 
         Called by the client immediately before it sends a ``ZQS1XY`` label
-        query. Pass ``None`` to clear the primer — the client does this when a
-        label query times out, so a late reply can't be misattributed to
-        whichever input is asked about next. See :attr:`pending_label_input`.
+        query. ``memory`` optionally restricts the expected response bank.
+        Pass ``None`` to clear the primer. After an abandoned query the client
+        also quarantines that bank until reconnect, because clearing the primer
+        alone cannot distinguish a late reply once the next input is primed.
         """
         self._pending_label_input = input_number
+        self._pending_label_memory = memory
 
     def add_response_observer(self, observer: ResponseObserver) -> Callable[[], None]:
         """Register a per-response callback; returns an unregister callable.
@@ -366,30 +440,42 @@ class LumagenProtocol:
         observer once at construction and expects it to outlive a reconnect.
         """
         self._rx.clear()
+        self._discarding_line = False
         self._pending_label_input = None
+        self._pending_label_memory = None
 
     def feed_bytes(self, data: bytes | bytearray) -> None:
         """Append inbound bytes and emit an update for each complete line.
 
         A ``line`` ends at the first ``\\n`` we see. Trailing ``\\r`` is
         stripped. Empty lines are ignored. If the buffer exceeds
-        :data:`MAX_RX_BUFFER` without a newline, we discard and warn — this
-        is recovery from a missing terminator, not normal operation.
+        :data:`MAX_RX_BUFFER` without a newline, we warn and discard through
+        the next newline — this is recovery from a missing terminator, not
+        normal operation.
         """
-        if not data:
-            return
-        self._rx.extend(data)
-        while True:
-            nl = self._rx.find(b"\n")
-            if nl < 0:
-                if len(self._rx) > MAX_RX_BUFFER:
+        start = 0
+        while start < len(data):
+            nl = data.find(b"\n", start)
+            end = len(data) if nl < 0 else nl
+            length = len(self._rx) + end - start
+            if not self._discarding_line:
+                if length > MAX_RX_BUFFER:
                     _LOGGER.warning(
                         "RX buffer exceeded %d bytes without a newline; discarding", MAX_RX_BUFFER
                     )
                     self._rx.clear()
+                    self._discarding_line = True
+                elif nl < 0 or length <= MAX_LINE_LENGTH + 1:
+                    self._rx.extend(data[start:end])
+            if nl < 0:
                 return
-            raw = bytes(self._rx[:nl])
-            del self._rx[: nl + 1]
+            start = nl + 1
+            if self._discarding_line or length > MAX_LINE_LENGTH + 1:
+                self._rx.clear()
+                self._discarding_line = False
+                continue
+            raw = bytes(self._rx)
+            self._rx.clear()
             if raw.endswith(b"\r"):
                 raw = raw[:-1]
             if not raw:
@@ -397,11 +483,10 @@ class LumagenProtocol:
             if len(raw) > MAX_LINE_LENGTH:
                 _LOGGER.debug("Discarding a %d-byte line as damaged", len(raw))
                 continue
-            try:
-                line = raw.decode("ascii", errors="replace")
-            except Exception:  # pragma: no cover — decode("replace") can't raise
+            if any(byte < 0x20 or byte > 0x7E for byte in raw):
+                _LOGGER.debug("Discarding a line containing non-printable ASCII")
                 continue
-            self._process_line(line)
+            self._process_line(raw.decode("ascii"))
 
     # ------------------------------------------------------------------
     # Line / response handling
@@ -417,6 +502,8 @@ class LumagenProtocol:
         if len(tail) < 3:
             return
         code = tail[:3]
+        if re.fullmatch(r"[A-Z][A-Z0-9]{2}", code) is None:
+            return
         # Most responses delimit the payload with a comma (``!S02,1``), but
         # not all do — a response that packs its payload straight onto the
         # code (``!I30Y4N``) would otherwise be read as having no payload at
@@ -425,14 +512,17 @@ class LumagenProtocol:
         # and for genuinely payload-less responses (``!S00``) the slice is
         # empty anyway.
         data = tail[4:] if len(tail) > 3 and tail[3] == "," else tail[3:]
-        self._handle_response(code, data)
+        self._handle_response(code, data, delimited=len(tail) > 3 and tail[3] == ",")
 
-    def _handle_response(self, code: str, data: str) -> None:
+    def _handle_response(self, code: str, data: str, *, delimited: bool) -> None:
         # Build a shallow copy of the current state, mutate fields on it,
         # and swap it in at the end. This avoids ``replace(**kwargs)`` with
         # a loosely-typed dict (mypy rightly rejects that) while still
         # firing exactly one callback per inbound line.
         pending = replace(self._state)
+        accepted = _valid_report(code, data, delimited=delimited)
+        if accepted:
+            pending.valid_response_generation += 1
         touched: tuple[str, ...] = (code,)
         # Whether the response contributed to state. A False here means we
         # skip the state commit but STILL notify response observers below:
@@ -445,18 +535,24 @@ class LumagenProtocol:
         elif code == "S01":
             self._handle_s01(data, pending)
         elif code == "S02":
-            pending.power_on = data[:1] == "1"
+            if data in ("0", "1"):
+                pending.power_on = data == "1"
+            else:
+                applied = False
         elif code in ("S1A", "S1B", "S1C", "S1D"):
             # Input label response. ``data`` is the whole label (commas and
             # spaces preserved). The response carries only the memory letter,
             # so we rely on the client-primed pending input to know which
             # logical input it belongs to.
-            if self._pending_label_input is None:
+            if self._pending_label_input is None or (
+                self._pending_label_memory is not None and code != f"S1{self._pending_label_memory}"
+            ):
                 _LOGGER.debug("Input label response %r with no pending input; ignoring", data)
                 applied = False
             else:
                 n = self._pending_label_input
                 self._pending_label_input = None
+                self._pending_label_memory = None
                 # Build a fresh dict so the previous state's map is untouched
                 # — the equality diff below depends on old and new not
                 # aliasing.
@@ -484,13 +580,22 @@ class LumagenProtocol:
         elif code == "I30":
             self._handle_i30(data, pending)
         elif code == "I50":
-            pending.display_supports_rec2020 = data[:1] == "Y"
+            if data in ("Y", "N"):
+                pending.display_supports_rec2020 = data == "Y"
+            else:
+                applied = False
         elif code == "I52":
             self._handle_i52(data, pending)
         elif code == "I53":
-            pending.game_mode = data[:1] == "1"
+            if data in ("0", "1"):
+                pending.game_mode = data == "1"
+            else:
+                applied = False
         elif code == "I54":
-            pending.auto_aspect = data[:1] == "1"
+            if data in ("0", "1"):
+                pending.auto_aspect = data == "1"
+            else:
+                applied = False
         elif code == "O01":
             self._handle_o01(data, pending)
         else:
@@ -504,7 +609,12 @@ class LumagenProtocol:
             changed = not self._state_matches_ignoring_codes(pending)
             self._state = pending
             if changed:
-                self._on_update(self._state, touched)
+                try:
+                    self._on_update(self._state, touched)
+                except Exception:
+                    _LOGGER.exception("State update callback raised")
+        elif accepted:
+            self._state = pending
 
         # Observers run last, and unconditionally, so a client awaiting this
         # code resumes only after state and state-listeners have settled.
@@ -569,9 +679,13 @@ class LumagenProtocol:
         """!I00 = ``<input>,<memory>,<config>``."""
         state.input_info_raw = data
         parts = data.split(",", 2)
-        if len(parts) >= 1:
+        if (
+            len(parts) >= 1
+            and re.fullmatch(r"[0-9]{1,2}", parts[0])
+            and _in_range(parts[0], 1, _MAX_INPUT)
+        ):
             state.current_input = parts[0]
-        if len(parts) >= 2:
+        if len(parts) >= 2 and parts[1] in _INPUT_MEMORIES:
             state.input_memory = parts[1]
 
     @staticmethod
@@ -596,13 +710,10 @@ class LumagenProtocol:
         # Compacting out commas and whitespace reduces all three to "Y4N",
         # so the positional reads below work regardless of framing.
         compact = data.replace(",", "").replace(" ", "").strip()
-        if len(compact) >= 1 and compact[0] in ("Y", "N"):
+        if re.fullmatch(r"[YN][0-7][HN]", compact):
+            state.sharpness_report_generation += 1
             state.sharpness_enabled = compact[0] == "Y"
-        if len(compact) >= 2 and compact[1].isdigit():
-            level = int(compact[1])
-            if 0 <= level <= 7:
-                state.sharpness_level = level
-        if len(compact) >= 3 and compact[2] in ("H", "N"):
+            state.sharpness_level = int(compact[1])
             state.sharpness_sensitivity = SharpnessSensitivity(compact[2])
         if state.sharpness_enabled is None and state.sharpness_level is None:
             # Nothing recognisable — surface the raw bytes so an unexpected
@@ -627,7 +738,7 @@ class LumagenProtocol:
         "unknown" rather than a misleading "0 nits".
         """
         parts = data.split(",")
-        if not parts:
+        if parts[0] not in ("0", "1"):
             return
         is_hdr = parts[0] == "1"
         # Note: !I52 is parallel to !I24's HDR flag; trust !I24 as primary
@@ -645,17 +756,23 @@ class LumagenProtocol:
         # HDR source — pull mastering metadata.
         if len(parts) >= 2:
             try:
-                state.hdr_source_min_luminance = float(parts[1])
+                minimum = float(parts[1])
+                if math.isfinite(minimum) and minimum >= 0:
+                    state.hdr_source_min_luminance = minimum
             except TypeError, ValueError:
                 _LOGGER.debug("Could not parse !I52 Min field %r", parts[1])
         if len(parts) >= 3:
             try:
-                state.hdr_source_max_luminance = int(parts[2])
+                maximum = int(parts[2])
+                if maximum >= 0:
+                    state.hdr_source_max_luminance = maximum
             except TypeError, ValueError:
                 _LOGGER.debug("Could not parse !I52 Max field %r", parts[2])
         if len(parts) >= 4:
             try:
-                state.hdr_source_max_cll = int(parts[3])
+                cll = int(parts[3])
+                if cll >= 0:
+                    state.hdr_source_max_cll = cll
             except TypeError, ValueError:
                 _LOGGER.debug("Could not parse !I52 Cll field %r", parts[3])
 
@@ -777,6 +894,10 @@ class LumagenProtocol:
         """
         state.output_mode_raw = data
         fields = data.split(",")
+        if len(fields) < 3 or any(
+            re.fullmatch(r"[0-9]+", field.strip()) is None for field in fields[1:3]
+        ):
+            return
 
         def numeric(index: int) -> int | None:
             if len(fields) <= index:

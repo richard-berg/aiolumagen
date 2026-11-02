@@ -21,6 +21,8 @@ width is tolerance-bounded rather than nearest-match (see
 
 from __future__ import annotations
 
+import math
+
 _NTSC_FAMILY: frozenset[int] = frozenset({23, 29, 47, 59, 71, 95, 119})
 """Truncated rate codes belonging to the NTSC ``/1.001`` family.
 
@@ -81,7 +83,10 @@ def decode_vertical_rate(code: str) -> float | None:
         return None
     if truncated in _NTSC_FAMILY:
         return round((truncated + 1) / 1.001, 3)
-    return float(truncated)
+    try:
+        return float(truncated)
+    except OverflowError:
+        return None
 
 
 def decode_aspect_ratio(code: str) -> float | None:
@@ -103,7 +108,10 @@ def decode_aspect_ratio(code: str) -> float | None:
         return None
     if hundredths <= 0:
         return None
-    return hundredths / 100
+    try:
+        return hundredths / 100
+    except OverflowError:
+        return None
 
 
 def derive_horizontal_resolution(vertical: str, aspect: str) -> int | None:
@@ -139,7 +147,12 @@ def derive_horizontal_resolution(vertical: str, aspect: str) -> int | None:
     ratio = decode_aspect_ratio(aspect)
     if ratio is None:
         return None
-    computed = height * ratio
+    try:
+        computed = height * ratio
+    except OverflowError:
+        return None
+    if not math.isfinite(computed):
+        return None
     nearest = min(COMMON_WIDTHS, key=lambda width: abs(width - computed))
     if abs(nearest - computed) <= computed * SNAP_TOLERANCE:
         return nearest

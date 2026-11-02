@@ -381,6 +381,69 @@ def test_i30_unparseable_payload_leaves_fields_none() -> None:
     assert state.sharpness_raw == "????"
 
 
+def test_identical_valid_sharpness_reports_advance_generation_without_notifying() -> None:
+    updates, proto = _collect()
+    assert proto.state.sharpness_report_generation == 0
+    proto.feed_bytes(b"!I30,Y4N\r\n")
+    previous_report = proto.state
+    assert previous_report.sharpness_report_generation == 1
+    proto.feed_bytes(b"!I30,Y4N\r\n")
+    assert proto.state.sharpness_report_generation == 2
+    assert previous_report.sharpness_report_generation == 1
+    assert proto.state == previous_report
+    assert len(updates) == 1
+
+
+@pytest.mark.parametrize(
+    "damaged",
+    [b"", b"Y", b"Y4", b"Y8N", b"Y4?", b"Y4Ntrailing", b"?", b"Y4\xff"],
+)
+def test_invalid_sharpness_reports_do_not_advance_valid_report_generation(damaged: bytes) -> None:
+    _, proto = _collect()
+    proto.feed_bytes(b"!I30,Y4N\r\n")
+    proto.feed_bytes(b"!I30," + damaged + b"\r\n")
+    assert proto.state.sharpness_report_generation == 1
+    assert proto.state.sharpness_enabled is True
+    assert proto.state.sharpness_level == 4
+    assert proto.state.sharpness_sensitivity == "N"
+
+
+def test_sharpness_generation_changes_only_when_a_complete_valid_report_is_parsed() -> None:
+    _, proto = _collect()
+    proto.feed_bytes(b"!I30,Y")
+    assert proto.state.sharpness_report_generation == 0
+    proto.feed_bytes(b"4")
+    assert proto.state.sharpness_report_generation == 0
+    proto.feed_bytes(b"H\r\n")
+    assert proto.state.sharpness_report_generation == 1
+    proto.feed_bytes(b"!I53,1\r\n")
+    assert proto.state.sharpness_report_generation == 1
+    proto.feed_bytes(b"!I30,N7")
+    proto.reset()
+    assert proto.state.sharpness_report_generation == 1
+    proto.feed_bytes(b"H\r\n!I30,N7H\r\n")
+    assert proto.state.sharpness_report_generation == 2
+
+
+@pytest.mark.parametrize("reply", [b"!I30Y4N\r\n", b"!I30,Y,4,N\r\n", b"!I30, Y 4 N \r\n"])
+def test_all_supported_sharpness_framings_advance_valid_report_generation(reply: bytes) -> None:
+    _, proto = _collect()
+    proto.feed_bytes(reply)
+    assert proto.state.sharpness_report_generation == 1
+
+
+def test_valid_response_generation_is_independent_of_payload_changes() -> None:
+    updates, proto = _collect()
+    assert proto.state.valid_response_generation == 0
+    proto.feed_bytes(b"!S02,0\r\n!S02,0\r\n!I99,\r\n")
+    assert proto.state.valid_response_generation == 3
+    assert len(updates) == 1
+    before = proto.state
+    proto.feed_bytes(b"!I30,Y\r\n!I25,garbage\r\n!I99,garbage\r\n")
+    assert proto.state.valid_response_generation == 3
+    assert before.valid_response_generation == 3
+
+
 def test_i53_game_mode_on_off() -> None:
     updates, proto = _collect()
     proto.feed_bytes(b"!I53,1\r\n")

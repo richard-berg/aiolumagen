@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from collections.abc import Callable
 from contextlib import suppress
 from typing import Protocol
@@ -103,7 +104,7 @@ class LumagenClient:
         ``None`` disables polling entirely (pure push mode).
     :param status_poll_interval: Seconds between ``ZQI25`` polls when the
         Lumagen reports power on. ``None`` disables.
-    :param stale_timeout: Seconds without inbound bytes after which the
+    :param stale_timeout: Seconds without an accepted device report after which the
         client marks itself unavailable and forces a transport reconnect.
         Must be greater than the longest poll interval — see the
         constructor's ValueError below for details.
@@ -190,6 +191,10 @@ class LumagenClient:
         poll_intervals = [
             iv for iv in (power_poll_interval, status_poll_interval) if iv is not None
         ]
+        if any(not math.isfinite(iv) or iv <= 0 for iv in (*poll_intervals, stale_timeout)):
+            raise ValueError(
+                "poll intervals and stale_timeout must be finite and greater than zero"
+            )
         if poll_intervals and stale_timeout <= max(poll_intervals):
             raise ValueError(
                 f"stale_timeout ({stale_timeout}s) must be greater than the "
@@ -213,16 +218,20 @@ class LumagenClient:
         self._handshake_active = False
         self._recovery_pending = False
         self._started = False
+        self._lifecycle_lock = asyncio.Lock()
+        self._label_lock = asyncio.Lock()
+        self._label_desynced: set[str] = set()
         self._last_response_time: float | None = None
+        self._last_valid_response_generation = 0
         # When the current transport connection was opened. Silence is
-        # measured from the later of this and the last inbound bytes, so a
+        # measured from the later of this and the last accepted report, so a
         # link that connects and never answers still counts as stale — and a
         # freshly (re)opened one isn't judged stale before it had a chance.
         self._connected_at: float | None = None
         self._available = False
         # Reconnect backoff. _next_reconnect_at is a loop-time deadline; 0.0
         # means "no failure pending, attempt immediately". Reset whenever
-        # bytes arrive, i.e. whenever the link has proven itself again.
+        # a valid report arrives, i.e. whenever the link has proven itself again.
         self._reconnect_delay = self.RECONNECT_BACKOFF_INITIAL
         self._next_reconnect_at = 0.0
         self._reconnect_failures = 0
@@ -251,13 +260,20 @@ class LumagenClient:
 
         Safe to call once. Subsequent calls are no-ops until :meth:`stop`.
         """
+        async with self._lifecycle_lock:
+            if self._started:
+                return
+            try:
+                await self._start()
+            except BaseException:
+                await self._stop()
+                raise
+
+    async def _start(self) -> None:
         if self._started:
             return
-        # Wrap the protocol's feed_bytes so we can track liveness at the
-        # byte-stream level. The protocol layer suppresses callbacks when
-        # state doesn't change (the publish_if_changed optimization), so we
-        # can't rely on state-update callbacks alone — a steady-state
-        # Lumagen would look unresponsive even while polls succeed.
+        # State callbacks suppress unchanged replies; the accepted-report
+        # generation also advances on those, but never on byte-level noise.
         self._transport.set_data_callback(self._on_bytes_received)
         self._transport.set_connection_lost_callback(self._on_transport_lost)
         await self._transport.connect()
@@ -269,26 +285,37 @@ class LumagenClient:
 
     async def stop(self) -> None:
         """Cancel polling and disconnect the transport. Idempotent."""
+        async with self._lifecycle_lock:
+            cleanup = asyncio.create_task(self._stop(), name="aiolumagen-stop")
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                await cleanup
+                raise
+
+    async def _stop(self) -> None:
         # Cleared first so a byte arriving mid-stop can't flip availability
         # and spawn a recovery refresh after _cancel_recovery() has run.
         self._started = False
-        if self._poll_task is not None:
-            self._poll_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self._poll_task
-            self._poll_task = None
-        if self._refresh_task is not None:
-            self._refresh_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self._refresh_task
-            self._refresh_task = None
-        if self._link_down_task is not None:
-            self._link_down_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self._link_down_task
-            self._link_down_task = None
-        await self._cancel_recovery()
+        tasks = [
+            task
+            for task in (
+                self._poll_task,
+                self._refresh_task,
+                self._link_down_task,
+                self._recovery_task,
+            )
+            if task is not None
+        ]
+        self._poll_task = self._refresh_task = self._link_down_task = self._recovery_task = None
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         self._fail_waiters("Client stopped while awaiting a response")
+        self._available = False
+        self._connected_at = self._last_response_time = None
+        self._protocol.reset()
+        self._label_desynced.clear()
         await self._transport.disconnect()
 
     @property
@@ -304,15 +331,15 @@ class LumagenClient:
     def available(self) -> bool:
         """True when the Lumagen is actively responding.
 
-        Becomes True on the first inbound bytes, reverts to False if no
-        bytes have arrived within ``stale_timeout`` seconds (default 90s).
+        Becomes True on the first accepted report, reverts to False if none
+        arrives within ``stale_timeout`` seconds (default 90s).
         The timeout must be longer than the longest poll interval so a
         normal poll cycle has time to write the query, await the response,
         and update ``_last_response_time`` before the next staleness check
         runs. With the default 60s polls, 90s gives one full cycle of slack
-        plus another 30s for transient network delays. Tracks raw bytes
-        rather than state changes so a steady-state Lumagen (polls
-        succeeding but returning identical data) still counts as alive.
+        plus another 30s for transient network delays. Accepted, equal-valued
+        replies and empty unsupported-query replies keep a steady-state or
+        older Lumagen alive; noise and malformed reports do not.
         """
         if not self._available:
             return False
@@ -393,6 +420,12 @@ class LumagenClient:
 
     def _discard_waiter(self, code: str, future: asyncio.Future[str]) -> None:
         """Remove a waiter, whether it resolved, timed out, or was abandoned."""
+        if not future.done():
+            future.cancel()
+        elif not future.cancelled():
+            # A link loss can fail this future while the caller is still in
+            # write(), which may itself fail before the future is awaited.
+            future.exception()
         waiters = self._response_waiters.get(code)
         if waiters is None:
             return
@@ -494,8 +527,8 @@ class LumagenClient:
         limit = self.RESPONSE_TIMEOUT if timeout is None else timeout
         future = self._register_waiter(code)
         try:
-            await self.send_command(command, refresh=False)
             async with asyncio.timeout(limit):
+                await self.send_command(command, refresh=False)
                 return await future
         finally:
             self._discard_waiter(code, future)
@@ -707,17 +740,19 @@ class LumagenClient:
         wrong with the sleep: it spent 1.2 s unconditionally even when the
         device answered in 20 ms, and a reply slower than the window landed
         while the *next* input was already primed — silently attributing one
-        input's label to another. A deadline can only ever drop a label, never
-        misfile one, and the primer is cleared on timeout to guarantee that.
+        input's label to another. Reads are serialized across callers. After
+        a timeout or cancellation, that memory bank is not queried again until
+        a fresh connection: a late reply has no request ID and cannot safely be
+        distinguished from the next input's reply.
 
         :param memory: Input memory to read labels from, ``A``-``D``. Labels
             are stored per (input, memory); ``A`` is the default/primary bank.
         :param timeout: Per-input deadline; defaults to
             :attr:`LABEL_QUERY_TIMEOUT`.
 
-        Inputs the device doesn't answer for (unpopulated inputs, or firmware
-        without ``ZQS1`` support) are simply left unset — a missing response
-        never raises. An invalid ``memory`` raises
+        Discovery stops at the first unanswered input; remaining labels stay
+        unset rather than risking misattribution. A missing response never
+        raises. An invalid ``memory`` raises
         :class:`~aiolumagen.exceptions.LumagenCommandError`, and a transport
         failure propagates as
         :class:`~aiolumagen.exceptions.LumagenConnectionError` (there's no
@@ -732,7 +767,8 @@ class LumagenClient:
             raise LumagenCommandError(f"input-label memory must be 'A'-'D', got {memory!r}")
         limit = self.LABEL_QUERY_TIMEOUT if timeout is None else timeout
         for input_number in range(1, 9):
-            await self._read_input_label(input_number, memory, limit)
+            if not await self._read_input_label(input_number, memory, limit):
+                break
 
     async def _read_input_label(self, input_number: int, memory: str, timeout: float) -> bool:
         """Query one input's label and wait for it. Returns whether it landed.
@@ -742,22 +778,38 @@ class LumagenClient:
         sequence wrong is how a label ends up filed under the wrong input, so
         it should not be written twice.
         """
-        self._protocol.expect_input_label(input_number)
+        async with self._label_lock:
+            return await self._read_input_label_locked(input_number, memory, timeout)
+
+    async def _read_input_label_locked(
+        self, input_number: int, memory: str, timeout: float
+    ) -> bool:
+        if memory in self._label_desynced:
+            return False
+        self._protocol.expect_input_label(input_number, memory=memory)
         # ZQS1XY: X = memory letter, Y = input - 1 (so '0' for input 1). The
         # reply is !S1X — the input digit is absent from it, which is exactly
         # why expect= can't be inferred from the command here.
+        succeeded = False
         try:
             await self.query_and_wait(
                 f"ZQS1{memory}{input_number - 1}",
                 expect=f"S1{memory}",
                 timeout=timeout,
             )
+            succeeded = True
         except TimeoutError:
             # Clear the primer so a late reply can't be misattributed to
             # whichever input is asked about next.
-            self._protocol.expect_input_label(None)
             _LOGGER.debug("No label response for input %d (memory %s)", input_number, memory)
             return False
+        finally:
+            self._protocol.expect_input_label(None)
+            if not succeeded:
+                # The reply has no input number or request ID. Once a query
+                # is abandoned, any subsequent reply for this bank could be
+                # that old one. Only a fresh connection restores attribution.
+                self._label_desynced.add(memory)
         return True
 
     async def set_input_label(self, input_number: int, label: str, *, memory: str = "A") -> None:
@@ -1055,7 +1107,7 @@ class LumagenClient:
         Every handshake goes through here — at :meth:`start`, after a
         reconnect, and as the recovery re-query itself — so that a recovery
         edge *caused* by the handshake's own replies is recognised as already
-        handled. If the handshake fails even though bytes arrived during it
+        handled. If the handshake fails even though valid reports arrived during it
         (an unsolicited push from a device that then ignored ``ZQS01``), the
         edge it absorbed is still owed a re-query, so one is scheduled.
         """
@@ -1291,7 +1343,7 @@ class LumagenClient:
 
         Also supervises the link. It is *down* when the transport has
         dropped, or when it is open but nothing has arrived for
-        ``stale_timeout`` (measured from the later of the last inbound bytes
+        ``stale_timeout`` (measured from the later of the last accepted report
         and when the connection was opened). While it is down we:
           1. Once per outage, mark the client unavailable, notify listeners
              so the coordinator flags entities unavailable in HA, and fail
@@ -1384,7 +1436,14 @@ class LumagenClient:
         Only once the poll loop is running: it owns link supervision, and
         during :meth:`start`'s handshake a drop is the first tick's to handle.
         """
-        if not self._started or self._poll_task is None:
+        if not self._started:
+            return
+        self._fail_waiters("Transport disconnected while awaiting a response")
+        if self._poll_task is None:
+            if self._available:
+                self._available = False
+                self._link_lost = True
+                self._notify_listeners(("_unavailable",))
             return
         if self._link_down_task is not None and not self._link_down_task.done():
             return
@@ -1409,15 +1468,14 @@ class LumagenClient:
             self._handling_link_down = False
 
     async def _handle_link_down_once(self, reason: str) -> None:
+        # These replies belonged to the connection being discarded, even if
+        # it never became available.
+        self._fail_waiters("Transport reconnecting; response will not arrive")
         if self._available:
             self._available = False
             self._link_lost = True
             _LOGGER.warning("Lumagen is now unavailable (%s), reconnecting", reason)
             self._notify_listeners(("_unavailable",))
-            # Anything still awaiting a reply is waiting on a subscription
-            # we're about to throw away.
-            self._fail_waiters("Transport reconnecting; response will not arrive")
-
         loop = asyncio.get_running_loop()
         if loop.time() < self._next_reconnect_at:
             return
@@ -1425,6 +1483,7 @@ class LumagenClient:
         # about to tear down; the reconnect runs its own handshake.
         await self._cancel_recovery()
         try:
+            self._protocol.reset()
             await self._transport.disconnect()
             await asyncio.sleep(self.RECONNECT_SETTLE)
             await self._transport.connect()
@@ -1432,9 +1491,9 @@ class LumagenClient:
             self._reconnect_failed(str(err))
             return
         self._connected_at = loop.time()
-        self._protocol.reset()
+        self._label_desynced.clear()
         await self._run_handshake()
-        # _on_bytes_received resets the backoff when the device answers; an
+        # Accepted device reports reset the backoff; an
         # open transport that stays silent is the half-open case and counts
         # as a failure, or it would be retried every tick without backing off.
         if not self._available:
@@ -1458,14 +1517,19 @@ class LumagenClient:
         )
 
     def _on_bytes_received(self, data: bytes) -> None:
-        """Called for every inbound chunk — updates liveness + feeds parser.
+        """Parse inbound chunks; only accepted reports refresh liveness."""
+        if not self._started or not data:
+            return
+        self._protocol.feed_bytes(data)
+        if self._record_valid_response():
+            self._notify_listeners(("_available",))
 
-        This is the liveness source of truth: any bytes arriving from the
-        Lumagen (even a no-op poll response that doesn't change state)
-        count as "the channel is healthy". The protocol layer's state-
-        change callback is strictly narrower — use it for state, not
-        liveness.
-        """
+    def _record_valid_response(self) -> bool:
+        """Refresh liveness on report progress; return whether this recovered."""
+        generation = self.state.valid_response_generation
+        if generation == self._last_valid_response_generation:
+            return False
+        self._last_valid_response_generation = generation
         self._last_response_time = asyncio.get_event_loop().time()
         recovered = not self._available
         if recovered:
@@ -1485,12 +1549,7 @@ class LumagenClient:
         self._reconnect_delay = self.RECONNECT_BACKOFF_INITIAL
         self._next_reconnect_at = 0.0
         self._reconnect_failures = 0
-        self._protocol.feed_bytes(data)
-        if recovered:
-            # The counterpart of "_unavailable". Listeners otherwise only hear
-            # about state changes, and a device whose state didn't change
-            # during the outage would never tell them the link is back.
-            self._notify_listeners(("_available",))
+        return recovered
 
     def _notify_listeners(self, codes: tuple[str, ...]) -> None:
         """Tell listeners about a link event; one failing listener can't stop the rest."""
@@ -1499,6 +1558,9 @@ class LumagenClient:
                 listener(self._protocol.state, codes)
 
     def _on_protocol_update(self, state: LumagenState, codes: tuple[str, ...]) -> None:
+        # State listeners must see availability from the accepted report that
+        # caused this update. Equal/unsupported reports are handled after feed.
+        recovered = self._record_valid_response()
         for listener in list(self._listeners):
             try:
                 listener(state, codes)
@@ -1506,3 +1568,5 @@ class LumagenClient:
                 _LOGGER.exception("Sync state listener raised; dropping it")
                 with suppress(ValueError):
                     self._listeners.remove(listener)
+        if recovered:
+            self._notify_listeners(("_available",))

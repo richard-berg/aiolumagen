@@ -246,10 +246,10 @@ async def test_poll_loop_skips_status_when_powered_off(
     assert all(b"ZQI25" not in chunk for chunk in fake_transport.sent)
 
 
-async def test_liveness_tracks_bytes_not_state_changes(
+async def test_liveness_tracks_valid_reports_not_state_changes(
     fake_transport: FakeTransport,
 ) -> None:
-    """Steady-state polls (bytes arrive but state doesn't change) keep the
+    """Steady-state polls (valid reports arrive but state doesn't change) keep the
     client available. Regression for the bug where liveness was tied to
     state-change callbacks, which the parser suppresses when the Lumagen's
     values are unchanged — leading to false-positive stale detection on
@@ -273,7 +273,7 @@ async def test_liveness_tracks_bytes_not_state_changes(
 
     # Feed an identical !S01 — same model/firmware as before. The parser
     # will NOT fire a state-change callback because nothing changed, but
-    # the byte stream should still refresh liveness.
+    # the accepted report should still refresh liveness.
     fake_transport.feed(b"!S01,FakeModel,000000,0000,000000\r\n")
     assert c._last_response_time is not None
     assert c._last_response_time > first_response_time
@@ -1243,8 +1243,13 @@ async def test_query_input_labels_sends_serial_queries(
     await c.start()
     fake_transport.sent.clear()
 
-    # Nothing answers, so every input burns its (tiny) deadline. The point is
-    # that all 8 still go out — a timeout skips one label, not the sweep.
+    original_write = fake_transport.write
+
+    async def answer(data: bytes) -> None:
+        await original_write(data)
+        fake_transport.feed(b"!S1A,label\r\n")
+
+    fake_transport.write = answer  # type: ignore[method-assign]
     await c.query_input_labels(memory="A", timeout=0.01)
 
     await c.stop()

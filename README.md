@@ -471,7 +471,65 @@ power-cycling, because it also covers outcomes that could not be confirmed.
 
 No `LumagenAuthError` — the Lumagen itself has no authentication. Any transport-layer auth errors (e.g. wrong ESPHome PSK) surface as `LumagenConnectionError` via serialx.
 
-No timeout exception either: nothing in the client is request/response, so there's no outstanding request for a deadline to apply to. Impose your own with `asyncio.timeout` and catch the builtin `TimeoutError` (this is what `ha-lumagen`'s config flow does while waiting for `!S01`).
+There is no library-specific timeout exception. `query_and_wait()` and
+`wait_for_response()` raise the builtin `TimeoutError`; the query deadline covers
+both writing and waiting. Pending response waiters fail with
+`LumagenConnectionError` immediately on disconnect, including in push-only mode.
+Most setters remain fire-and-forget: `set_sharpness()` writes the setter and a
+status query, but does **not** wait for readback.
+
+### Response correlation and damaged streams
+
+`query_and_wait("ZQI30")` registers before writing and returns the next matching
+payload, after state listeners have run. Response codes are broadcast: concurrent
+waiters for the same code receive the same next response, not separately ordered
+acknowledgements. Unsolicited, delayed, unsupported (empty), or malformed payloads
+can also satisfy a waiter; a response is not proof the command succeeded.
+Subscribers receive codes such as `("I30",)` only when state actually changes;
+an equal-valued reply still resolves a response waiter.
+
+For compound sharpness controls, `client.state.sharpness_report_generation`
+counts complete, valid `I30` reports, including identical replies. It starts at
+zero, survives reconnects of the same client, and does not advance on writes,
+empty/invalid reports, or partial lines. It does not participate in state
+equality, so it does not force subscriber callbacks. Read `client.state` afresh
+rather than retaining an old snapshot.
+
+To merge quick successive writes, serialize them and keep the pending complete
+sharpness tuple with the generation observed **before sending**. On each next
+action, use pending values while the current generation equals that baseline;
+once it advances, discard pending values and use the new report, even if it is
+equal to the old report (the device may have rejected a write). Invalid-report
+callbacks must not clear pending values. Reset pending metadata when replacing
+the client. This mechanism adds no wait or failure to `set_sharpness()`, including
+on firmware that does not answer `ZQI30`. A generation proves a valid report
+arrived, not which write it answers: delayed reports have no transaction IDs.
+
+Input-label reads are serialized because replies omit the input number. Discovery
+stops on the first timeout; after an abandoned read (including cancellation), that
+memory bank is quarantined until a fresh connection. Continuing immediately would
+allow a delayed reply to be silently filed under the next input. Previously read
+labels remain available.
+
+The parser rejects overlong or non-printable/non-ASCII lines. After an unterminated
+buffer overflows, it discards through the next newline rather than accepting a
+damaged suffix as a new response. Invalid boolean replies preserve known state,
+and invalid/nonfinite HDR metadata never becomes a reported measurement.
+Availability/stale detection tracks accepted reports, not byte traffic:
+`state.valid_response_generation` advances on validated known reports, including
+equal-valued replies, and on comma-delimited empty query replies in the S/I/O
+namespaces. Bare `!S00` heartbeats also count. Standby and unsupported queries on
+older firmware therefore remain healthy, while noise, truncated/invalid reports
+and unknown nonempty payloads cannot keep a dead device available. Like the
+sharpness generation, this counter is excluded from state equality and survives
+reconnects. Shape-valid reports have no checksum/authentication, so this is damage
+detection, not proof of the sender's identity.
+
+Concurrent starts/stops are serialized, cancelled startup closes its transport,
+and cancellation of an in-progress stop waits for cleanup before propagating.
+Reusing a stopped client clears partial lines and label context; late bytes from
+closed/replaced connections are ignored. Numeric command fields require integers
+(not floats or booleans), so validation cannot accidentally emit extra wire bytes.
 
 The firmware subsystem is the one documented exception, and it doesn't change that rule. A firmware session *is* request/response — `C` returns a checksum, an erase streams a token per sector — so a reply that never arrives is a real failure with a real deadline. Rather than adding a general timeout exception only one subsystem could raise, those deadlines surface as `LumagenFirmwareError` naming what was being waited on.
 

@@ -100,12 +100,15 @@ class _BridgeProtocol(asyncio.Protocol):
     def __init__(self, owner: LumagenTransport) -> None:
         self._owner = owner
         self.lost = False
+        self.transport: asyncio.BaseTransport | None = None
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        self.transport = transport
         _LOGGER.debug("Serial connection established via %s", self._owner.url)
 
     def data_received(self, data: bytes) -> None:
-        self._owner._emit(data)
+        if self is self._owner._protocol and not self.lost:
+            self._owner._emit(data)
 
     def connection_lost(self, exc: Exception | None) -> None:
         _LOGGER.debug("Serial connection closed (%s): %s", self._owner.url, exc)
@@ -130,6 +133,7 @@ class LumagenTransport:
         self._transport: asyncio.Transport | None = None
         self._protocol: _BridgeProtocol | None = None
         self._connected = False
+        self._connection_lock = asyncio.Lock()
 
     @property
     def connected(self) -> bool:
@@ -150,10 +154,16 @@ class LumagenTransport:
         self._on_connection_lost = callback
 
     async def connect(self) -> None:
+        async with self._connection_lock:
+            await self._connect()
+
+    async def _connect(self) -> None:
         if self._connected:
             return
         loop = asyncio.get_running_loop()
         protocol = _BridgeProtocol(self)
+        self._protocol = protocol
+        transport: asyncio.Transport | None = None
         try:
             transport, _protocol = await serialx.create_serial_connection(
                 loop,
@@ -161,18 +171,32 @@ class LumagenTransport:
                 url=self.url,
                 baudrate=self.baudrate,
             )
+            if protocol.lost:
+                raise LumagenConnectionError("the connection closed as it opened")
+        except asyncio.CancelledError:
+            self._close_opening(protocol, transport)
+            raise
         except Exception as err:
+            self._close_opening(protocol, transport)
             raise LumagenConnectionError(self._connect_error_message(err)) from err
-        if protocol.lost:
-            # Closed before we'd even taken it; nobody was told, so say it here.
-            raise LumagenConnectionError(
-                f"Could not open {self.url!r}: the connection closed as it opened"
-            )
         self._transport = transport
         self._protocol = protocol
         self._connected = True
 
+    def _close_opening(
+        self, protocol: _BridgeProtocol, transport: asyncio.Transport | None
+    ) -> None:
+        if self._protocol is protocol:
+            self._protocol = None
+        opened = transport if transport is not None else protocol.transport
+        if opened is not None:
+            opened.close()
+
     async def disconnect(self) -> None:
+        async with self._connection_lock:
+            self._disconnect()
+
+    def _disconnect(self) -> None:
         # Forgotten before closing, so the connection_lost this causes is
         # recognised as ours and not reported as a loss.
         self._protocol = None
@@ -184,7 +208,13 @@ class LumagenTransport:
     async def write(self, data: bytes) -> None:
         if not self._connected or self._transport is None:
             raise LumagenConnectionError("Transport is not connected")
-        self._transport.write(data)
+        try:
+            self._transport.write(data)
+        except Exception as err:
+            self._disconnect()
+            if self._on_connection_lost is not None:
+                self._on_connection_lost()
+            raise LumagenConnectionError(f"Could not write to {self.url!r}: {err}") from err
 
     # -- Flow control and line rate ----------------------------------------
     #
